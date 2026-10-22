@@ -36,6 +36,27 @@ def child_command(args, tii, lora, destination):
             + cmd[at + 1:])
 
 
+def check_launch_configuration(cmd, historical):
+    """Check the CIFAR single-process launch before any checkpoint/GPU work.
+
+    main adds config names; torchrun/init_distributed_mode supplies process
+    fields; the CIFAR loader adds nb_classes and class_names. Only class_names
+    is deferred here. The final-stage observer still checks every field.
+    """
+    current = vars(base.grid.parsed_config(cmd))
+    config_name = cmd[cmd.index('main.py') + 1]
+    if (config_name != 'cifar100_lora' or current['dataset'] != 'Split-CIFAR100'
+            or '--nproc_per_node=1' not in cmd):
+        raise ValueError('Unsupported score-audit launch configuration')
+    current.update(config=config_name, subparser_name=config_name,
+                   world_size=1, rank=0, gpu=0, distributed=True, dist_backend='nccl',
+                   nb_classes=100)
+    names = historical.get('class_names')
+    if not isinstance(names, list) or len(names) != 100 or not all(isinstance(n, str) for n in names):
+        raise ValueError('Historical CIFAR class_names are incomplete')
+    probe.check_configuration(current, {k: v for k, v in historical.items() if k != 'class_names'})
+
+
 def combine_scores(destination, expected_samples):
     arms = {}
     for arm in ('class_gate', 'full'):
@@ -102,6 +123,11 @@ def main():
     tii = args.output_root / 'cifar100_tii_original_10tasks_seed42'
     lora = args.output_root / 'cifar100_lora_rank8_baseline_10tasks_seed42'
     plain = base.build_command(args, tii, lora, 'full')
+    for arm in ('full', 'class_gate'):
+        old_header, _ = compare.load_task(args.history / arm / 'task_00.jsonl')
+        check_launch_configuration(base.build_command(args, tii, lora, arm),
+                                   old_header['configuration'])
+    print('SCORE_AUDIT_LAUNCH_CONFIG=PASS_BOTH_ARMS', flush=True)
     source = base.verify.source_digest()
     if source != old_common['source_sha256']:
         raise ValueError('Evaluator source differs from historical run; do not bypass this check')

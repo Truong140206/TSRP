@@ -22,7 +22,7 @@ def config(path, weight=.7):
         rp_route_fusion_weight=weight, rp_class_fusion_weight=.5,
         rp_class_fusion_gate='margin', rp_class_fusion_min_tasks=1,
         rp_class_fusion_sharpen=1., rp_fusion_ramp=0., classifier_union_audit=False,
-        prediction_trace_dir=str(path))
+        prediction_trace_dir=str(path), opt_betas=(.9, .999))
 
 
 def manifest(path):
@@ -71,6 +71,52 @@ def test_configuration_guard_rejects_changed_fusion(field, value):
     current[field] = value
     with pytest.raises(ValueError, match='differs'):
         probe.check_configuration(current, historical)
+
+
+def test_real_cifar_parser_configuration_survives_json_roundtrip(tmp_path):
+    args = SimpleNamespace(dataset='cifar100', seed=42, batch_size=24, port=29558,
+                           resolved_data_path=tmp_path / 'data')
+    cmd = runner.base.build_command(args, tmp_path / 'tii', tmp_path / 'lora', 'full')
+    current = vars(runner.base.grid.parsed_config(cmd))
+    historical = json.loads(json.dumps(current))
+    assert current['opt_betas'] == (.9, .999)
+    assert historical['opt_betas'] == [.9, .999]
+    probe.check_configuration(current, historical)
+
+
+@pytest.mark.parametrize('betas', [[.8, .999], [.999, .9], [.9], ['0.9', '0.999'], None])
+def test_json_normalization_does_not_hide_changed_betas(betas):
+    current = vars(config('new'))
+    historical = json.loads(json.dumps(vars(config('old'))))
+    current['opt_betas'] = betas
+    with pytest.raises(ValueError, match='opt_betas'):
+        probe.check_configuration(current, historical)
+
+
+def test_configuration_guard_handles_nested_json_sequences_and_missing_keys():
+    current = dict(vars(config('new')), nested={'values': ((1, 2), (3, 4))})
+    historical = json.loads(json.dumps(current))
+    probe.check_configuration(current, historical)
+    current['nested']['values'] = ((1, 2), (4, 3))
+    with pytest.raises(ValueError, match='nested'):
+        probe.check_configuration(current, historical)
+    current = vars(config('new'))
+    historical = json.loads(json.dumps(current))
+    current['unexpected'] = None
+    with pytest.raises(ValueError, match='unexpected'):
+        probe.check_configuration(current, historical)
+
+
+def test_configuration_guard_still_rejects_unsupported_matching_configuration():
+    current = dict(vars(config('new')), rp_class_fusion_weight=.7)
+    with pytest.raises(ValueError, match='only the checked paper configuration'):
+        probe.check_configuration(current, json.loads(json.dumps(current)))
+
+
+def test_configuration_guard_rejects_nonfinite_values():
+    current = dict(vars(config('new')), opt_betas=(.9, float('nan')))
+    with pytest.raises(ValueError):
+        probe.check_configuration(current, current)
 
 
 def test_observer_validates_nonselected_rows(tmp_path):
@@ -176,9 +222,12 @@ def test_child_command_keeps_eval_configuration_and_torchrun(tmp_path):
         sys.argv = old_argv
     assert parsed.eval and parsed.seed == 42 and parsed.rp_route_fusion_weight == .7
     assert parsed.En == 'gen' and parsed.tau == -10 and parsed.num_tasks == 10
+    probe.check_configuration(vars(parsed), json.loads(json.dumps(vars(parsed))))
 
 
-@pytest.mark.parametrize('problem', [None, 'source', 'checkpoints', 'runtime', 'data'])
+@pytest.mark.parametrize('problem', [None, 'source', 'checkpoints', 'runtime', 'data',
+                                    'full_config', 'class_gate_config', 'extra_config',
+                                    'missing_config', 'process_config'])
 def test_read_only_preflight_never_starts_gpu_or_writes_output(monkeypatch, tmp_path, problem):
     out, data, history = (tmp_path / name for name in ('out', 'data', 'old'))
     for path in (out, data, history):
@@ -195,12 +244,46 @@ def test_read_only_preflight_never_starts_gpu_or_writes_output(monkeypatch, tmp_
         common['runtime'] = dict(runtime, torch='changed')
     elif problem == 'data':
         common['dataset_path'] = 'changed'
-    monkeypatch.setattr(sys, 'argv', ['audit', '--output-root', str(out), '--data-root', str(data),
-                                     '--history', str(history), '--tag', 'scores'])
+    # Use main's real argument parser, then the effective fields added by the
+    # single-process launch and CIFAR dataset loader, before JSON persistence.
+    import main as application
+    launch = SimpleNamespace(dataset='cifar100', seed=42, batch_size=24, port=29558,
+                             resolved_data_path=data)
+    tii = out / 'cifar100_tii_original_10tasks_seed42'
+    lora = out / 'cifar100_lora_rank8_baseline_10tasks_seed42'
+    configurations = {}
+    old_argv = sys.argv
+    try:
+        for arm in ('full', 'class_gate'):
+            cmd = runner.base.build_command(launch, tii, lora, arm, history / arm)
+            sys.argv = cmd[cmd.index('main.py'):]
+            effective = application.get_args()
+            effective.world_size = 1
+            effective.rank, effective.gpu = 0, 0
+            effective.distributed, effective.dist_backend = True, 'nccl'
+            effective.nb_classes = 100
+            effective.class_names = ['class%d' % c for c in range(100)]
+            configurations[arm] = json.loads(json.dumps(vars(effective)))
+    finally:
+        sys.argv = old_argv
+    if problem in ('full_config', 'class_gate_config'):
+        configurations[problem.removesuffix('_config')]['opt_betas'][1] = .99
+    elif problem == 'extra_config':
+        configurations['full']['unknown_field'] = None
+    elif problem == 'missing_config':
+        del configurations['full']['lr_noise']  # A missing None-valued key is still a mismatch.
+    elif problem == 'process_config':
+        configurations['full']['world_size'] = 2
+    argv = ['audit', '--output-root', str(out), '--data-root', str(data),
+            '--history', str(history), '--tag', 'scores']
+    if problem and problem.endswith('_config'):
+        argv.append('--run')  # Even an authorized GPU run must fail at CPU preflight.
+    monkeypatch.setattr(sys, 'argv', argv)
     monkeypatch.setattr(runner, 'fingerprint_history', lambda p: {})
     monkeypatch.setattr(runner.stages, 'audit', lambda p: dict(dataset='Split-CIFAR100', seed=42,
         changed_class_samples=[dict(eval_task=3, index=702)]))
-    monkeypatch.setattr(runner.compare, 'load_task', lambda p: (dict(run=dict(common=common)), []))
+    monkeypatch.setattr(runner.compare, 'load_task', lambda p: (
+        dict(run=dict(common=common), configuration=configurations[p.parent.name]), []))
     monkeypatch.setattr(runner.base, 'resolve_data', lambda args: data)
     monkeypatch.setattr(runner.base.verify, 'source_digest', lambda: 'same')
     monkeypatch.setattr(runner.base.grid, 'manifest', lambda *a: ([], {}))
@@ -211,6 +294,10 @@ def test_read_only_preflight_never_starts_gpu_or_writes_output(monkeypatch, tmp_
     monkeypatch.setattr(runner.base, 'idle_gpu', forbidden)
     monkeypatch.setattr(runner.base, 'execute', forbidden)
     monkeypatch.setattr(runner.base, 'save_new', forbidden)
+    if problem and problem.endswith('_config'):
+        # A configuration failure must precede even CPU checkpoint loading,
+        # not just precede the GPU subprocess.
+        monkeypatch.setattr(runner.base.grid, 'manifest', forbidden)
     if problem:
         with pytest.raises(ValueError, match='differ'):
             runner.main()

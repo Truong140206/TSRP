@@ -64,11 +64,15 @@ def describe_scores(primary, rp, final, target, primary_class, final_class):
 
 
 def check_configuration(current, historical):
-    def without_trace_path(config):
-        return {k: v for k, v in config.items() if k != 'prediction_trace_dir'}
-    if without_trace_path(current) != without_trace_path(historical):
+    def recorded_form(config):
+        # TraceWriter serializes tuples as JSON arrays. Compare that same
+        # representation on both sides; preserve every value and sequence order.
+        return json.loads(json.dumps({k: v for k, v in config.items()
+                                     if k != 'prediction_trace_dir'}, allow_nan=False))
+    current, historical = recorded_form(current), recorded_form(historical)
+    if current != historical:
         differing = sorted(k for k in current.keys() | historical.keys()
-                           if k != 'prediction_trace_dir' and current.get(k) != historical.get(k))
+                           if k not in current or k not in historical or current[k] != historical[k])
         raise ValueError('Replay configuration differs: ' + ', '.join(differing))
     required = dict(eval=True, num_tasks=10, rp_class_fusion_gate='margin',
                     rp_class_fusion_weight=.5, rp_class_fusion_sharpen=1., rp_fusion_ramp=0.,

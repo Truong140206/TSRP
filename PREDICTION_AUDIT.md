@@ -216,6 +216,15 @@ Full's six logged metrics must also match at every stage. If exact reproduction
 fails, preserve the diagnostic output and investigate; do not relax checks just
 to obtain scores. Old outputs are never overwritten; retry with a new tag.
 
+Launch configuration for both arms is checked on CPU before checkpoint loading
+or GPU work (`SCORE_AUDIT_LAUNCH_CONFIG=PASS_BOTH_ARMS`). Comparisons use the
+recorded JSON representation: parser tuples such as `opt_betas=(0.9, 0.999)`
+match JSON arrays with the same ordered values; actual value differences still
+fail. Dataset-derived class names are checked in the complete effective
+configuration at the final-stage observer, alongside all other fields.
+An interrupted evaluation cannot resume from a logged stage number: this runner
+does not persist the RP state, so a new run must reconstruct it.
+
 New files under `<output-root>/<tag>/cifar100/seed42/` include full traces,
 `full/scores.json`, `class_gate/scores.json`, and `score_report.json`. The report
 contains primary logits before the gate, RP scores, actual final logits, an
