@@ -1,5 +1,4 @@
 """Synthetic trace/command checks. These are not experimental results."""
-import ast
 import hashlib
 import importlib.util
 import json
@@ -17,6 +16,38 @@ _spec.loader.exec_module(_trace)
 TraceWriter, start_trace = _trace.TraceWriter, _trace.start_trace
 from tools import compare_prediction_traces as compare
 from tools import run_prediction_audit as runner
+
+
+# Exact additions from 42ea682 to 8e48ed7, including the two added blank lines.
+# Remove only these hooks, then hash source rather than Python-version-specific
+# ast.dump output. All other source, including indentation and strings, is kept.
+_OBSERVER_HOOKS = (
+    'from engines.prediction_trace import start_trace\n',
+    '    prediction_trace = start_trace(args, data_loader, i, task_id + 1, class_mask)\n',
+    '            if prediction_trace is not None:\n'
+    '                prediction_trace.begin(input, target, lora_id, prompt_id, logits, target_task_map)\n',
+    '            if prediction_trace is not None:\n'
+    '                prediction_trace.routing(prompt_id, fusion_rp_scores)\n',
+    '            if prediction_trace is not None:\n'
+    '                prediction_trace.drm(logits)\n',
+    '            if prediction_trace is not None:\n'
+    '                prediction_trace.crm(logits, filtered_index_tensor, corr_id,\n'
+    '                                     ensemble_id[:, 1] if task_id > 0 else None)\n\n',
+    '            if prediction_trace is not None:\n'
+    '                prediction_trace.end(logits)\n\n',
+    '    if prediction_trace is not None:\n'
+    "        prediction_trace.close(metric_logger.meters['Acc@1'].global_avg,\n"
+    "                               metric_logger.meters['Acc@task'].global_avg)\n",
+)
+
+
+def engine_source_without_observer(source):
+    source = source.replace('\r\n', '\n').replace('\r', '\n')
+    for hook in _OBSERVER_HOOKS:
+        if source.count(hook) != 1:
+            raise AssertionError('Expected exactly one unchanged observer hook: ' + hook)
+        source = source.replace(hook, '', 1)
+    return source
 
 
 class TraceTests(unittest.TestCase):
@@ -197,26 +228,37 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(list(out.iterdir()), [])
 
     def test_engine_algorithm_is_unchanged_outside_observer_hooks(self):
-        class RemoveObserver(ast.NodeTransformer):
-            def visit_ImportFrom(self, node):
-                return None if node.module == 'engines.prediction_trace' else node
-
-            def visit_Assign(self, node):
-                if any(isinstance(t, ast.Name) and t.id == 'prediction_trace' for t in node.targets):
-                    return None
-                return self.generic_visit(node)
-
-            def visit_If(self, node):
-                if (isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name)
-                        and node.test.left.id == 'prediction_trace'):
-                    return None
-                return self.generic_visit(node)
-
         source = (_path.parent / 'hrm_lora_wtp_and_tap_engine.py').read_text(encoding='utf-8')
-        restored = RemoveObserver().visit(ast.parse(source))
-        digest = hashlib.sha256(ast.dump(restored).encode()).hexdigest()
-        # Baseline: local public repository HEAD 42ea682, before instrumentation.
-        self.assertEqual(digest, '5552d7a8978b635bd17cbd7ceb4b0c4ff511861816198faab94ef1185b9a03d4')
+        restored = engine_source_without_observer(source)
+        digest = hashlib.sha256(restored.encode('utf-8')).hexdigest()
+        # SHA256 of the original UTF-8/LF Git blob at 42ea682, not an AST dump.
+        self.assertEqual(digest, '99509a73fba96d9bdbaf58b55cccb41bd150e0f3df284065daa5529dd1a49dc6')
+
+    def test_engine_source_guard_is_line_ending_independent(self):
+        source = (_path.parent / 'hrm_lora_wtp_and_tap_engine.py').read_text(encoding='utf-8')
+        self.assertEqual(engine_source_without_observer(source),
+                         engine_source_without_observer(source.replace('\n', '\r\n')))
+
+    def test_engine_source_guard_preserves_algorithm_changes(self):
+        source = (_path.parent / 'hrm_lora_wtp_and_tap_engine.py').read_text(encoding='utf-8')
+        mutations = (
+            source.replace('logits[equal_drm] = output_drm_logits',
+                           'logits[equal_drm] = output_drm_logits * 0', 1),
+            source.replace(_OBSERVER_HOOKS[3],
+                           _OBSERVER_HOOKS[3] + '                logits.zero_()\n', 1),
+        )
+        for changed in mutations:
+            self.assertNotEqual(source, changed)
+            self.assertNotEqual(engine_source_without_observer(source),
+                                engine_source_without_observer(changed))
+
+    def test_engine_source_guard_rejects_changed_or_duplicate_hooks(self):
+        source = (_path.parent / 'hrm_lora_wtp_and_tap_engine.py').read_text(encoding='utf-8')
+        for hook in _OBSERVER_HOOKS:
+            for replacement in ('', hook + hook, hook.replace('prediction_trace', 'changed_trace')):
+                changed = source.replace(hook, replacement, 1)
+                with self.assertRaises(AssertionError):
+                    engine_source_without_observer(changed)
 
 
 if __name__ == '__main__':
