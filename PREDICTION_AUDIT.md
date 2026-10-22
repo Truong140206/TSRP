@@ -183,3 +183,52 @@ matrix products under batch permutation and subsetting. A deliberately
 constructed counterexample verifies that task-correct routing does not enforce
 class correctness; **it is not evidence about which real CIFAR images failed**.
 These synthetic checks complement, rather than replace, the real-image audit.
+
+## Targeted score audit after the CPU stage report
+
+The old traces do **not** contain logits, margins, or saved RP weights. To explain
+specific final errors, `tools/run_prediction_score_audit.py` can reconstruct the
+head and observe scores without changing the method. This probe is scoped to the
+completed CIFAR-100 seed42 run. It selects **all** final repairs/harms from that
+run, not only two examples, and highlights corrected-adapter class harms.
+
+```bash
+python tools/run_prediction_score_audit.py \
+  --output-root /path/to/hrm-pet-output \
+  --data-root /path/to/datasets \
+  --history /path/to/hrm-pet-output/review2_direct_errors_cifar100_s42_20261022_v1/cifar100/seed42 \
+  --tag review2_score_probe_v1
+```
+
+Without `--run`, this is read-only CPU preflight. Adding `--run` requires a free
+GPU. It does **not train adapters**, but it is **not a quick log-only operation**:
+the original Full ten-stage checkpoint/feature-accumulation/ridge-solve/evaluation
+sequence is rerun once, preserving earlier evaluation passes and RNG consumption.
+Then gated class-only is evaluated at the final stage using the same final model
+and already-built RP state. No second RP rebuild is performed. Its earlier-stage
+or retention metrics are not recomputed or inferred from Full's history.
+
+The probe refuses changed evaluator source, checkpoint hashes/paths, data path,
+runtime versions/device mask, or evaluation configuration. Every final-stage
+sample in both arms must reproduce **all** fields and tensor hashes in the
+historical trace, including inputs, initial logits, RP scores and final logits.
+Full's six logged metrics must also match at every stage. If exact reproduction
+fails, preserve the diagnostic output and investigate; do not relax checks just
+to obtain scores. Old outputs are never overwritten; retry with a new tag.
+
+New files under `<output-root>/<tag>/cifar100/seed42/` include full traces,
+`full/scores.json`, `class_gate/scores.json`, and `score_report.json`. The report
+contains primary logits before the gate, RP scores, actual final logits, an
+independently calculated margin/effective RP weight, and the primary/RP weighted
+score gaps between the true class and the primary winner. Scalar reconstruction
+must match actual final logits within `1e-4 + 1e-5 * max(abs(final_logits))`.
+
+Report-only calculations also swap the two arms' effective RP weights while
+keeping each arm's own primary/RP vectors fixed, and calculate an ungated
+`beta=0.5` mixture. These calculations never feed back into evaluation. They are
+numerical counterfactuals on selected test errors, **not** whole-dataset ablations,
+validation evidence for a new hyperparameter, or independent causal stage effects.
+Tied counterfactual winners are marked ambiguous, not forced to a class.
+
+Only `SCORE_AUDIT_COMPLETE=1/1` after all checks confirms completion. Tracing
+overhead is not a method runtime/memory benchmark, and no unmeasured ETA is given.
