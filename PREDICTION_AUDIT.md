@@ -123,3 +123,63 @@ After this case passes, check the remaining seeds and datasets, then measure
 cost **without tracing**. Tracing synchronises CPU/GPU and hashes tensors; its
 runtime/memory must not be reported as the method's overhead. Historical
 validation evidence and order sensitivity remain separate review items.
+
+## CPU-only stage drill-down of completed runs
+
+When task routing improves but class accuracy does not, first inspect the traces
+already saved by the audit. **Do not rerun training or GPU evaluation for this
+step.** The additional analyzer accepts historical traces from commit `095a660`;
+it records the analyzer's current hash separately from the original provenance.
+
+```bash
+PY=/home/s24gbn1/Documents/truongnguyen/Hybrid_ReMatching/.venv/bin/python
+OUT=/home/s24gbn1/Documents/truongnguyen/hrm-pet-output
+REPORTS=$(mktemp -d "$OUT/review2_stage_audit_XXXXXX")
+CUDA_VISIBLE_DEVICES="" "$PY" -B tools/audit_prediction_stages.py \
+  --run-dir "$OUT/review2_direct_errors_cifar100_s42_20261022_v1/cifar100/seed42" \
+  --output "$REPORTS/cifar100.json"
+```
+
+Run this from a checkout containing `tools/audit_prediction_stages.py`. For the
+completed ImageNet-R pilot, use
+`$OUT/review2_direct_errors_s42_20261022_v1/imr/seed42` and a separate output file.
+The analyzer needs only the Python standard library, no CUDA or torch. It refuses
+to overwrite a report or write inside the historical run directory.
+
+It checks trace pairing, coverage, checksums, observer-state invariants, and all
+reconstructed fields against the stored summary. It then reports:
+
+- `stage_pairs`: full versus gated class-only class predictions immediately
+  after DRM, after CRM, and after class fusion. Accuracy arrays are ordered
+  `[class_gate, full]`; raw counts and task-balanced changes are separate.
+- `within_arm`: changes from DRM to CRM and CRM to final prediction within each
+  arm. Here arrays are ordered `[earlier stage, later stage]`.
+- `final_error_paths`: correctness paths of final repairs/harms. For example,
+  `repaired -> repaired -> harmed` means full was correct and class-only wrong
+  after DRM and CRM, but the correctness relation reverses after class fusion.
+- `corrected_adapter_class_harms`: every image whose retained adapter becomes
+  task-correct while its final class changes from correct to wrong, with both
+  arms' decisions, target, per-task index, and input fingerprint.
+- `changed_class_samples` in the saved JSON: all final correctness repairs and
+  harms, not just a selected example. Indices are zero-based within each test
+  task; class IDs follow the recorded class masks, not human-readable labels.
+- `consistency_flags`: samples with identical proposals but different final
+  classes, or identical retained adapters but different CRM/final classes.
+  Nonzero flags require inspection (including numerical effects); they are not
+  automatically classified as implementation bugs.
+
+`STAGE_AUDIT_COMPLETE=1/1` means the offline report is complete, **not** that the
+method is beneficial or every algorithmic assumption has been validated.
+Historical traces store class decisions but not full scores or margins. These
+paths cannot by themselves prove a calibration problem, or isolate independent
+causal effects of routing, CRM and the gate. Follow-up score-level replay is a
+separate decision after reading this report.
+
+The added CPU tests compare the actual evaluator against independent per-image
+scalar calculations for routing, DRM, CRM, and margin fusion, including the
+paper's generalized-entropy threshold, heterogeneous routes, unseen-class masks,
+and different batch sizes. The real LoRA pool is also compared against individual
+matrix products under batch permutation and subsetting. A deliberately
+constructed counterexample verifies that task-correct routing does not enforce
+class correctness; **it is not evidence about which real CIFAR images failed**.
+These synthetic checks complement, rather than replace, the real-image audit.
