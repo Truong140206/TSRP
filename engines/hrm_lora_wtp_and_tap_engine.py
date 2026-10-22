@@ -16,6 +16,7 @@ from timm.scheduler import create_scheduler
 from torch import optim
 import utils
 from engines.random_projection_head import accumulate_rp_statistics, fit_rp_temperature, rp_head_predict
+from engines.prediction_trace import start_trace
 
 
 
@@ -593,6 +594,7 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test: [Task {}]'.format(i + 1)
+    prediction_trace = start_trace(args, data_loader, i, task_id + 1, class_mask)
 
     # switch to evaluation mode
     model.eval()
@@ -775,6 +777,8 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
                 task_map_tensor[task_map_keys] = task_map_values
                 top5_id = torch.index_select(task_map_tensor, 0, top_5_indices.view(-1)).view_as(top_5_indices)
                 prompt_id = torch.tensor([target_task_map[v.item()] for v in prompt_class], device=device)
+            if prediction_trace is not None:
+                prediction_trace.begin(input, target, lora_id, prompt_id, logits, target_task_map)
             if bool(getattr(args, 'rp_route_fusion_drm', False)):
                 # Replace only HRM-PET's first stage. Its DRM/CRM refinement is
                 # what carries the baseline on ImageNet-R, so it is kept; the
@@ -790,6 +794,8 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
                 prompt_id = fuse_routers(
                     fusion_rp_scores, id_logits,
                     class_mask, task_id + 1, args, device)
+            if prediction_trace is not None:
+                prediction_trace.routing(prompt_id, fusion_rp_scores)
             ##############
             # target_id = torch.tensor([target_task_map[v.item()] for v in target], device=device)
 
@@ -819,6 +825,8 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
                 output_drm['logits'], class_mask, task_id + 1, args,
                 evaluation_task=i)
             logits[equal_drm] = output_drm_logits
+            if prediction_trace is not None:
+                prediction_trace.drm(logits)
             #promtp_idx = output['prompt_idx']  # tensor B x topk
             
             corr_id=None
@@ -862,6 +870,10 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
                     #     pass
                     
             
+            if prediction_trace is not None:
+                prediction_trace.crm(logits, filtered_index_tensor, corr_id,
+                                     ensemble_id[:, 1] if task_id > 0 else None)
+
             # HRM-PET (DRM+CRM) cost: 1 base LoRA per sample, +1 for DRM-rerouted
             # samples, +1 for CRM-rematched low-confidence samples (task_id > 0).
             default_lora_counts = torch.ones(
@@ -960,6 +972,12 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
             metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
             metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
             metric_logger.meters['Acc@task'].update(task_inference_acc.item(), n=input.shape[0])
+            if prediction_trace is not None:
+                prediction_trace.end(logits)
+
+    if prediction_trace is not None:
+        prediction_trace.close(metric_logger.meters['Acc@1'].global_avg,
+                               metric_logger.meters['Acc@task'].global_avg)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

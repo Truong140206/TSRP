@@ -49,11 +49,16 @@ def get_args():
         raise NotImplementedError
 
     get_args_parser(config_parser)
+    config_parser.add_argument('--prediction_trace_dir', default=None,
+                               help='Opt-in final-stage diagnostic trace; evaluation only')
     args = parser.parse_args()
     args.config = config
     return args
 
 def main(args):
+    if getattr(args, 'prediction_trace_dir', None) and (
+            not args.eval or getattr(args, 'train_inference_task_only', False)):
+        raise ValueError('Prediction traces are evaluation-only; no training is allowed')
     validate_exemplar_free_protocol(args)
     utils.init_distributed_mode(args)
     if args.output_dir:
