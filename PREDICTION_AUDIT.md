@@ -1,8 +1,9 @@
 # Direct prediction-error audit
 
 This audit measures prediction changes, not a new method or an updated paper
-result. Start with ImageNet-R, seed 42. Do not launch the full dataset/seed grid
-until this case passes.
+result. Supported datasets are ImageNet-R (`imr`), CIFAR-100 (`cifar100`),
+CUB-200 (`cub200`) and ImageNet-A (`ima`). Start with one seed-42 case;
+do not launch the full dataset/seed grid before checking its result.
 
 ## What is compared
 
@@ -13,7 +14,8 @@ until this case passes.
   dimension 10000, ReLU and ridge parameter 10000.
 - No adapter training. The existing evaluator still reconstructs RP statistics
   from training data and solves the ridge systems at each stage. This is not an
-  inexpensive log-only operation; no runtime estimate has been measured yet.
+  inexpensive log-only operation. Each new evaluation records its elapsed wall
+  time; do not infer an ImageNet-A ETA from an unrelated dataset's runtime.
 
 The first case runs **three evaluations**, sequentially: full without tracing,
 full with tracing, then gated class-only with tracing. The first two must agree
@@ -94,6 +96,51 @@ not proof of success. Look for `PREDICTION_AUDIT_COMPLETE=1/1`; on failure keep
 the log and diagnose before retrying. The completed result is:
 
 `$OUT/review2_direct_errors_s42_20261022_v1/imr/seed42/summary.json`
+
+## ImageNet-A seed-42 pilot
+
+Use the **existing matched Sup-21K checkpoints**, not the exploratory RanPAC
+checkpoint group:
+
+- `ima_tii_original_10tasks_seed42/checkpoint/task1_checkpoint.pth` through task10.
+- `ima_lora_rank8_baseline_10tasks_seed42/checkpoint/task1_checkpoint.pth` through task10.
+
+The same three-pass observer check is used. This adds a Full-versus-gated-class-only
+diagnostic at one seed, **not** a complete four-seed component ablation. Neither
+the method nor the saved adapters are retrained or changed.
+
+```bash
+python tools/run_prediction_audit.py \
+  --output-root /path/to/hrm-pet-output \
+  --data-root /path/to/datasets \
+  --dataset ima --seed 42 --tag review2_direct_errors_ima_s42_v1
+```
+
+This command is CPU preflight only; add `--run` when the GPU is free. Both
+`<loader-parent>/imagenet-a/train` and `test` must already contain the same
+200 nonempty class folders. Auto-discovery refuses missing or ambiguous splits.
+If multiple prepared copies exist, select the historical loader parent with
+`--data-path /exact/loader-parent`. Do not select a new split just to pass checks.
+Preflight does not call the ImageNet-A constructor, which otherwise can move raw
+images into a new split. No download, extraction or data rearrangement is allowed.
+
+Results are under `<output-root>/<tag>/ima/seed42/`. In addition to `summary.json`
+and final-stage traces, `timing.json` records each subprocess's wall time and
+their sum. It includes startup, data/checkpoint loading, RP reconstruction,
+ridge solves and all ten evaluation stages, with tracing in two passes. It
+excludes parent preflight/final verification. This is **not** isolated inference
+latency or a controlled comparison of method overhead. Cached older logs without
+timings produce `null`, not zero, and are not rerun solely to measure time.
+
+The launcher prints `AUDIT_EVAL_ELAPSED_SECONDS` after each pass, then
+`EVALUATION_SECONDS`, `TOTAL_EVALUATION_SECONDS`, `TIMING` and
+`PREDICTION_AUDIT_COMPLETE=1/1` after successful validation. ImageNet-A tasks can
+have unequal test sizes: interpret `task_balanced` rather than treating pooled
+repair-minus-harm counts as the paper's accuracy change.
+
+The offline stage analyzer below can read this pilot's traces. The separate
+score/margin replay tool remains scoped to CIFAR-100; it is not automatically
+enabled by this ImageNet-A pilot.
 
 ## How to interpret the result
 

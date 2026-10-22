@@ -9,12 +9,14 @@ This diagnostic is NOT a timing or memory benchmark. Only trusted checkpoints.
 import argparse
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -22,6 +24,8 @@ from tools import finish_soict_checks as finish
 from tools import verify_paper_results as verify
 from tools import verify_paper_backbone_grid as grid
 from tools.compare_prediction_traces import compare_directories
+
+DATASETS = {**verify.DATASETS, 'ima': ('Split-Imagenet-A', 'ima_lora')}
 
 
 def save_new(path, data):
@@ -34,11 +38,29 @@ def resolve_data(args):
     root = (args.data_path or args.data_root).resolve()
     if args.dataset == 'imr':
         return verify.resolve_imr_data_path(args.data_root, args.data_path)
+    if args.dataset == 'ima':
+        if args.data_path is None:
+            return grid.resolve_data(root, 'ima')
+        # --data-path selects the exact loader parent, not another nested split.
+        # Never instantiate Imagenet_A during preflight: it can move images.
+        labels = []
+        for split in ('train', 'test'):
+            folder = root / 'imagenet-a' / split
+            classes = sorted(p for p in folder.iterdir() if p.is_dir()) if folder.is_dir() else []
+            if len(classes) != 200 or not all(
+                    any(p.is_file() and p.suffix.lower() in verify.IMAGE_EXTENSIONS
+                        for p in cls.rglob('*')) for cls in classes):
+                raise ValueError('Need an existing nonempty 200-class ImageNet-A split: '
+                                 + str(folder) + '; no images were moved or split')
+            labels.append([p.name for p in classes])
+        if labels[0] != labels[1]:
+            raise ValueError('ImageNet-A train/test class names differ')
+        return root
     if args.dataset == 'cifar100':
         from torchvision.datasets import CIFAR100
         for train in (True, False):
             CIFAR100(str(root), train=train, download=False)
-    else:
+    elif args.dataset == 'cub200':
         # Do not call the CUB constructor: it may extract/re-split missing data.
         from torchvision.datasets import ImageFolder
         if not (root / 'CUB_200_2011.tgz').is_file():
@@ -51,6 +73,8 @@ def resolve_data(args):
             labels.append(obj.classes)
         if labels[0] != labels[1]:
             raise ValueError('CUB train/test labels differ')
+    else:
+        raise ValueError('Unsupported audit dataset: ' + args.dataset)
     return root
 
 
@@ -79,6 +103,7 @@ def execute(path, cmd, meta):
         stream.write('VERIFICATION_META=' + json.dumps(meta, sort_keys=True) + '\n')
         stream.write('COMMAND=' + json.dumps(cmd) + '\n')
         stream.flush()
+        started = time.perf_counter()
         process = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True,
                                    encoding='utf-8', errors='replace', bufsize=1)
@@ -87,18 +112,72 @@ def execute(path, cmd, meta):
             stream.flush()
             print(line, end='', flush=True)
         code = process.wait()
+        elapsed = time.perf_counter() - started
+        timing_line = 'AUDIT_EVAL_ELAPSED_SECONDS=%.6f' % elapsed
+        stream.write(timing_line + '\n')
         stream.write('VERIFICATION_EXIT_CODE=%d\n' % code)
+    print(timing_line + ' LOG=' + str(path), flush=True)
     if code:
         raise RuntimeError('Evaluation failed. Preserve log and use a new tag: ' + str(path))
     return grid.read_verified(path, meta, 10)
 
 
 def build_command(args, tii, lora, variant, trace=None):
-    cmd = finish.variant_command(args, args.seed, tii, lora,
-                                 'vit_base_patch16_224', variant)
+    if args.dataset == 'ima':
+        if variant not in ('full', 'class_gate'):
+            raise ValueError('ImageNet-A pilot supports only full and class_gate')
+        # Reuse the already verified ImageNet-A/Sup-21K evaluation command.
+        # Do not extend the dataset grid of unrelated historical runners.
+        cmd = grid.command(None, 'ima', 'sup', 'full', tii, lora, args.resolved_data_path)
+        finish.set_flag(cmd, '--seed', args.seed)
+        finish.set_flag(cmd, '--batch-size', args.batch_size)
+        cmd[cmd.index('--master_port=29558')] = '--master_port=' + str(args.port)
+        if variant == 'class_gate':
+            finish.set_flag(cmd, '--rp_route_fusion_weight', 1.0)
+    else:
+        cmd = finish.variant_command(args, args.seed, tii, lora,
+                                     'vit_base_patch16_224', variant)
     if trace is not None:
         cmd += ['--prediction_trace_dir', str(trace)]
     return cmd
+
+
+def evaluation_seconds(path):
+    lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    if lines[-1:] != ['VERIFICATION_EXIT_CODE=0']:
+        raise ValueError('Cannot report a completed evaluation time from: ' + str(path))
+    values = [line.split('=', 1)[1] for line in lines
+              if line.startswith('AUDIT_EVAL_ELAPSED_SECONDS=')]
+    if not values:
+        return None  # Older completed logs did not measure elapsed time.
+    if len(values) != 1:
+        raise ValueError('Ambiguous evaluation timing: ' + str(path))
+    value = float(values[0])
+    if not math.isfinite(value) or value < 0:
+        raise ValueError('Invalid evaluation timing: ' + str(path))
+    return value
+
+
+def save_timings(destination):
+    paths = {arm: destination / arm / 'console.log'
+             for arm in ('full_plain', 'full', 'class_gate')}
+    seconds = {arm: evaluation_seconds(path) for arm, path in paths.items()}
+    timing = dict(evaluation_seconds=seconds,
+                  total_evaluation_seconds=(sum(seconds.values())
+                                            if all(v is not None for v in seconds.values()) else None),
+                  log_sha256={arm: finish.file_hash(path) for arm, path in paths.items()},
+                  scope='Subprocess wall time: startup, data/checkpoint loading, RP rebuilding, '
+                        'ridge solves, all ten evaluation stages and tracing where enabled. '
+                        'Excludes parent preflight and final validation. Not isolated inference '
+                        'latency, training time, or a controlled method-cost benchmark. '
+                        'Missing timing in an older log is null, not zero.')
+    path = destination / 'timing.json'
+    if path.exists():
+        if json.loads(path.read_text(encoding='utf-8')) != timing:
+            raise ValueError('Existing timing report differs; preserve it and use a new tag')
+    else:
+        save_new(path, timing)
+    return timing, path
 
 
 def check_trace_metrics(result, logs):
@@ -114,7 +193,7 @@ def main():
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--data-path', type=Path)
-    parser.add_argument('--dataset', choices=verify.DATASETS, default='imr')
+    parser.add_argument('--dataset', choices=DATASETS, default='imr')
     parser.add_argument('--seed', type=int, choices=(42, 43, 44, 45), default=42)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--run', action='store_true')
@@ -191,6 +270,10 @@ def main():
                 raise ValueError('Existing summary differs; preserve it and use a new tag')
         else:
             save_new(summary, result)
+        timing, timing_path = save_timings(destination)
+        print('EVALUATION_SECONDS=' + json.dumps(timing['evaluation_seconds'], sort_keys=True), flush=True)
+        print('TOTAL_EVALUATION_SECONDS=' + json.dumps(timing['total_evaluation_seconds']), flush=True)
+        print('TIMING=' + str(timing_path), flush=True)
         print('PREDICTION_AUDIT_COMPLETE=1/1', flush=True)
         print('COUNTS=' + json.dumps(result['counts'], sort_keys=True), flush=True)
         print('PROPOSAL_VS_CLASS=' + json.dumps(result['proposal_vs_class'], sort_keys=True), flush=True)
