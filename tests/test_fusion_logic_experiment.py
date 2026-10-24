@@ -363,3 +363,37 @@ def test_child_cli_and_experimental_config_guards(monkeypatch,tmp_path):
         current['rp_lambda']=42
         with pytest.raises(ValueError,match='configuration differs'):
             probe.check_arm_configuration(current,vars(original),arm)
+
+
+@pytest.mark.parametrize('experiment', probe.EXPERIMENT_NAMES)
+def test_actual_worker_entrypoint_accepts_parent_launch_without_model_or_gpu(tmp_path,experiment):
+    # Launch the actual child script, not just main.py's inner argument parser.
+    # -S deliberately removes torch/numpy/site packages: CLI preflight must
+    # finish without importing model code or reading/writing checkpoints.
+    args=SimpleNamespace(dataset='ima',seed=44,batch_size=24,port=29558,
+        history=tmp_path/'missing_history',resolved_data_path=tmp_path/'data',experiment=experiment)
+    runner.check_child_cli(args,tmp_path/'tii',tmp_path/'lora',tmp_path/'not_created')
+    assert list(tmp_path.iterdir())==[]
+
+
+def test_actual_worker_cli_rejects_unknown_experiment_and_help_works(tmp_path):
+    import subprocess
+    worker=str(Path(probe.__file__).resolve())
+    prefix=[sys.executable,'-B','-S',worker]
+    help_result=subprocess.run(prefix+['--help'],capture_output=True,text=True,timeout=30)
+    assert help_result.returncode==0
+    assert 'crm_diagnostics' in help_result.stdout
+    invalid=subprocess.run(prefix+['--history',str(tmp_path/'old'),
+        '--destination',str(tmp_path/'new'),'--experiment','unknown','--check-cli','--','ima_lora'],
+        capture_output=True,text=True,timeout=30)
+    assert invalid.returncode==2 and 'invalid choice' in invalid.stderr
+    assert list(tmp_path.iterdir())==[]
+
+
+def test_parent_rejects_worker_cli_argument_drift(monkeypatch,tmp_path):
+    args=SimpleNamespace(dataset='ima',seed=42,batch_size=24,port=29558,
+        history=tmp_path/'old',resolved_data_path=tmp_path,experiment='crm_diagnostics')
+    monkeypatch.setattr(runner.subprocess,'run',lambda *a,**kw:SimpleNamespace(stdout='{}'))
+    with pytest.raises(ValueError,match='did not preserve'):
+        runner.check_child_cli(args,tmp_path/'tii',tmp_path/'lora',tmp_path/'new')
+    assert list(tmp_path.iterdir())==[]

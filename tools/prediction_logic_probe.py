@@ -23,6 +23,9 @@ from tools.prediction_score_probe import check_configuration
 from tools.run_prediction_audit import save_new
 
 
+EXPERIMENT_NAMES = ('gate_crm', 'crm_selector', 'crm_diagnostics')
+
+
 def variant_spec(name):
     if name == 'gate_crm':
         return variants
@@ -240,12 +243,27 @@ def summarize(history, destination, spec=None):
                 + 'share checkpoints, inputs and RP evidence; record losses as well as gains.')
 
 
-if __name__ == '__main__':
-    separator = sys.argv.index('--')
+def parse_cli(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    separator = argv.index('--') if '--' in argv else None
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--history', type=Path, required=True)
     parser.add_argument('--destination', type=Path, required=True)
-    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector'), default='gate_crm')
-    options = parser.parse_args(sys.argv[1:separator])
-    run_probe(options.history.resolve(), options.destination.resolve(), sys.argv[separator + 1:],
-              variant_spec(options.experiment))
+    parser.add_argument('--experiment', choices=EXPERIMENT_NAMES, default='gate_crm')
+    parser.add_argument('--check-cli', action='store_true',
+                        help='Validate worker arguments and print them without importing the model or running evaluation')
+    options = parser.parse_args(argv if separator is None else argv[:separator])
+    if separator is None or separator == len(argv)-1:
+        parser.error("Expected '--' followed by evaluator arguments")
+    return options, argv[separator+1:]
+
+
+if __name__ == '__main__':
+    options, application_args = parse_cli()
+    spec = variant_spec(options.experiment)
+    if options.check_cli:
+        print(json.dumps(dict(experiment=options.experiment,
+            history=str(options.history.resolve()), destination=str(options.destination.resolve()),
+            application_args=application_args)), flush=True)
+    else:
+        run_probe(options.history.resolve(), options.destination.resolve(), application_args, spec)

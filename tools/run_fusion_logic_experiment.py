@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,24 @@ def child_command(args, tii, lora, destination):
             + cmd[at + 1:])
 
 
+def check_child_cli(args, tii, lora, destination):
+    """Exercise the real worker entry point before allocating output/GPU work."""
+    command = child_command(args, tii, lora, destination)
+    worker = str(ROOT / 'tools' / 'prediction_logic_probe.py')
+    worker_args = command[command.index(worker)+1:]
+    separator = worker_args.index('--')
+    checked = subprocess.run([sys.executable, '-B', '-S', worker,
+        *worker_args[:separator], '--check-cli', *worker_args[separator:]],
+        check=True, capture_output=True, text=True, encoding='utf-8', timeout=30)
+    actual = json.loads(checked.stdout)
+    expected = dict(experiment=getattr(args,'experiment','gate_crm'),
+        history=str(args.history.resolve()), destination=str(destination.resolve()),
+        application_args=worker_args[separator+1:])
+    if actual != expected:
+        raise ValueError('Worker CLI did not preserve experiment/path/evaluator arguments')
+    print('LOGIC_CHILD_CLI=PASS', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', type=Path, required=True)
@@ -61,7 +80,7 @@ def main():
     parser.add_argument('--seed', type=int, choices=(42, 43, 44, 45), required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector', 'crm_diagnostics'), default='gate_crm')
+    parser.add_argument('--experiment', choices=probe.EXPERIMENT_NAMES, default='gate_crm')
     args = parser.parse_args()
     spec = probe.variant_spec(args.experiment)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.tag):
@@ -92,6 +111,7 @@ def main():
         old_header, _ = compare.load_task(args.history / arm / 'task_00.jsonl')
         check_launch(base.build_command(args, tii, lora, arm), old_header['configuration'], arm, spec)
     print('LOGIC_LAUNCH_CONFIG=PASS_BOTH_CONTROLS', flush=True)
+    check_child_cli(args, tii, lora, destination)
     source = base.verify.source_digest()
     if source != old_common['source_sha256']:
         raise ValueError('Paper evaluator source differs from history')
