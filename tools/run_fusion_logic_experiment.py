@@ -1,7 +1,7 @@
 """Read-only preflight by default; --run explicitly runs the IMA logic experiment.
 
-One historical Full reconstruction plus seven final-stage evaluations. Eight
-arms: original/z-score gate/refreshed CRM/both for Full and class-gate. Never
+One historical Full reconstruction plus remaining final-stage evaluations.
+Default: eight gate/CRM arms. --experiment crm_selector: six selector arms. Never
 overwrite historical data, retrain adapters or change the normal evaluator.
 """
 import argparse
@@ -19,7 +19,6 @@ from tools import run_prediction_audit as base
 from tools import audit_prediction_stages as stages
 from tools import compare_prediction_traces as compare
 from tools import prediction_logic_probe as probe
-from tools import fusion_logic_variants as variants
 
 
 def history_hashes(history):
@@ -30,7 +29,7 @@ def history_hashes(history):
     return {str(p): stages.sha256(p) for p in paths}
 
 
-def check_launch(cmd, historical, arm):
+def check_launch(cmd, historical, arm, spec=None):
     cfg = vars(base.grid.parsed_config(cmd))
     name = cmd[cmd.index('main.py') + 1]
     if name != 'ima_lora' or cfg['dataset'] != 'Split-Imagenet-A' or '--nproc_per_node=1' not in cmd:
@@ -41,14 +40,15 @@ def check_launch(cmd, historical, arm):
     if not isinstance(names, list) or len(names) != 200 or not all(isinstance(n, str) for n in names):
         raise ValueError('Historical ImageNet-A class names are incomplete')
     # Verify the actual labels again against historical trace headers in child.
-    probe.check_arm_configuration(cfg, {k: v for k, v in historical.items() if k != 'class_names'}, arm)
+    probe.check_arm_configuration(cfg, {k: v for k, v in historical.items() if k != 'class_names'}, arm, spec)
 
 
 def child_command(args, tii, lora, destination):
     cmd = base.build_command(args, tii, lora, 'full', destination / 'full')
     at = cmd.index('main.py')
     return (cmd[:at] + [str(ROOT / 'tools' / 'prediction_logic_probe.py'),
-                       '--history', str(args.history), '--destination', str(destination), '--']
+                       '--history', str(args.history), '--destination', str(destination),
+                       '--experiment', getattr(args, 'experiment', 'gate_crm'), '--']
             + cmd[at + 1:])
 
 
@@ -60,7 +60,9 @@ def main():
     parser.add_argument('--seed', type=int, choices=(42, 43, 44, 45), required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--run', action='store_true')
+    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector'), default='gate_crm')
     args = parser.parse_args()
+    spec = probe.variant_spec(args.experiment)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.tag):
         parser.error('Unsafe tag')
     for key in ('output_root', 'data_root', 'history'):
@@ -70,7 +72,7 @@ def main():
     destination = args.output_root / args.tag / 'ima' / ('seed%d' % args.seed)
     if destination.exists() or args.history == destination or args.history in destination.parents:
         raise ValueError('Preserve existing results; use a new tag outside the history directory')
-    variants.checked_source()
+    spec.checked_source()
     histories = history_hashes(args.history)
     audit = stages.audit(args.history)
     if audit['dataset'] != 'Split-Imagenet-A' or audit['seed'] != args.seed:
@@ -87,7 +89,7 @@ def main():
     plain = base.build_command(args, tii, lora, 'full')
     for arm in ('full', 'class_gate'):
         old_header, _ = compare.load_task(args.history / arm / 'task_00.jsonl')
-        check_launch(base.build_command(args, tii, lora, arm), old_header['configuration'], arm)
+        check_launch(base.build_command(args, tii, lora, arm), old_header['configuration'], arm, spec)
     print('LOGIC_LAUNCH_CONFIG=PASS_BOTH_CONTROLS', flush=True)
     source = base.verify.source_digest()
     if source != old_common['source_sha256']:
@@ -104,9 +106,10 @@ def main():
     drivers = {p.name: stages.sha256(p) for p in sorted((ROOT / 'tools').glob('*.py'))}
     common = dict(source_sha256=source, drivers=drivers, checkpoints=records,
                   runtime=runtime, dataset_path=str(args.resolved_data_path),
-                  experiment='gate_zscore_and_post_drm_crm_v1', settings=variants.ARMS,
+                  experiment=('gate_zscore_and_post_drm_crm_v1' if args.experiment == 'gate_crm'
+                              else 'fixed_candidates_crm_selectors_v1'), settings=spec.ARMS,
                   historical_sha256=histories)
-    print('LOGIC_PREFLIGHT=PASS; NO_ADAPTER_TRAINING; 8 final arms', flush=True)
+    print('LOGIC_PREFLIGHT=PASS; NO_ADAPTER_TRAINING; %d final arms' % len(spec.ARMS), flush=True)
     print('DESTINATION=' + str(destination), flush=True)
     if not args.run:
         print('READ_ONLY_PREFLIGHT_ONLY; append --run when GPU is free', flush=True)
@@ -120,8 +123,8 @@ def main():
         if history_hashes(args.history) != histories:
             raise ValueError('Historical files changed during preflight')
         destination.mkdir(parents=True, exist_ok=False)
-        base.save_new(destination / 'plan.json', dict(common=common, arms=variants.ARMS))
-        for arm in variants.ARMS:
+        base.save_new(destination / 'plan.json', dict(common=common, arms=spec.ARMS))
+        for arm in spec.ARMS:
             folder = destination / arm
             folder.mkdir()
             base.save_new(folder / 'run.json', dict(dataset_name='Split-Imagenet-A', seed=args.seed,
@@ -133,7 +136,7 @@ def main():
         if not base.verify.compare(historical, new_metrics, range(1, 11),
                                    base.verify.CORE + base.verify.RETENTION, label='LOGIC_HISTORICAL_FULL'):
             raise ValueError('Full sequence differs; do not interpret experimental results')
-        report = probe.summarize(args.history, destination)
+        report = probe.summarize(args.history, destination, spec)
         stats = json.loads((destination / 'final_stats.json').read_text(encoding='utf-8'))
         for arm, values in stats.items():
             if abs(values['Acc@1'] - report['arms'][arm]['task_balanced_accuracy']['final_class']) > .00011:

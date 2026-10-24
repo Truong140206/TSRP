@@ -1,7 +1,7 @@
-"""Experimental final-stage 2x2 gate/CRM comparison for both routing arms.
+"""Experimental final-stage gate/CRM or selector comparisons for both routing arms.
 
 Reproduce historical Full through all stages, then reuse that fixed final RP
-state/checkpoint for the other seven arms. Only final-stage results are claimed;
+state/checkpoint for the remaining arms. Only final-stage results are claimed;
 no invented retention curves. Defaults/paper engine files remain unchanged.
 """
 import argparse
@@ -23,11 +23,21 @@ from tools.prediction_score_probe import check_configuration
 from tools.run_prediction_audit import save_new
 
 
-def check_arm_configuration(current, historical, arm):
-    weight, gate, crm = variants.ARMS[arm]
+def variant_spec(name):
+    if name == 'gate_crm':
+        return variants
+    if name == 'crm_selector':
+        from tools import crm_selector_variants
+        return crm_selector_variants
+    raise ValueError('Unknown experiment: ' + name)
+
+
+def check_arm_configuration(current, historical, arm, spec=None):
+    spec = spec or variants
+    weight, first, second = spec.ARMS[arm]
     expected = dict(historical, rp_route_fusion_weight=weight)
     if arm not in ('full', 'class_gate'):
-        expected.update(experiment_gate_zscore=gate, experiment_crm_refresh=crm)
+        expected.update(dict(zip(spec.FLAGS, (first, second))))
     check_configuration(current, expected)
 
 
@@ -48,7 +58,8 @@ class HistoricalObserver:
                                  (row['true_task'], row['index']))
 
 
-def run_probe(history, destination, application_args):
+def run_probe(history, destination, application_args, spec=None):
+    spec = spec or variants
     import numpy as np
     import torch
     import main as application
@@ -59,7 +70,7 @@ def run_probe(history, destination, application_args):
     old_start, old_evaluate = engine.start_trace, trainer.evaluate_till_now
     old_argv = sys.argv
     finished = False
-    closed = {arm: set() for arm in variants.ARMS}
+    closed = {arm: set() for arm in spec.ARMS}
     timings, final_stats = {}, {}
 
     def start(args, loader, task, stage, masks):
@@ -67,13 +78,13 @@ def run_probe(history, destination, application_args):
         if writer is None:
             return None
         arm = Path(args.prediction_trace_dir).name
-        if arm not in variants.ARMS:
+        if arm not in spec.ARMS:
             raise ValueError('Unknown experiment arm')
         old_header, old_rows = compare.load_task(history / 'full' / ('task_%02d.jsonl' % task))
         for key in ('dataset', 'seed', 'stage', 'eval_task', 'samples', 'class_mask'):
             if writer.header[key] != old_header[key]:
                 raise ValueError('Historical header mismatch: ' + key)
-        check_arm_configuration(writer.header['configuration'], old_header['configuration'], arm)
+        check_arm_configuration(writer.header['configuration'], old_header['configuration'], arm, spec)
         observer = writer
         if arm in ('full', 'class_gate'):
             _, rows = compare.load_task(history / arm / ('task_%02d.jsonl' % task))
@@ -105,7 +116,7 @@ def run_probe(history, destination, application_args):
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
         try:
-            for arm, (weight, gate, crm) in variants.ARMS.items():
+            for arm, (weight, first, second) in spec.ARMS.items():
                 if arm == 'full':
                     continue
                 restore_rng()
@@ -113,8 +124,8 @@ def run_probe(history, destination, application_args):
                 alternate.rp_route_fusion_weight = weight
                 alternate.prediction_trace_dir = str(destination / arm)
                 if arm != 'class_gate':
-                    alternate.experiment_gate_zscore = gate
-                    alternate.experiment_crm_refresh = crm
+                    for flag, value in zip(spec.FLAGS, (first, second)):
+                        setattr(alternate, flag, value)
                 print('LOGIC_ARM_START=' + arm + '; final stage only, no RP rebuild', flush=True)
                 began = time.perf_counter()
                 stats = [engine.evaluate(model, original_model, loaders[t]['val'], device, i=t,
@@ -135,19 +146,19 @@ def run_probe(history, destination, application_args):
         if (not args.eval or args.train_inference_task_only or args.num_tasks != 10
                 or args.dataset != 'Split-Imagenet-A' or args.task_inc
                 or args.rp_route_fusion_weight != .7
-                or any(hasattr(args, flag) for flag in variants.FLAGS)):
+                or any(hasattr(args, flag) for flag in spec.FLAGS)):
             raise ValueError('Expected unchanged ImageNet-A Full evaluation configuration')
         if Path(args.prediction_trace_dir).resolve() != destination / 'full':
             raise ValueError('Unexpected experiment trace path')
         engine.start_trace, trainer.evaluate_till_now = start, evaluate
-        with variants.installed(engine):
+        with spec.installed(engine):
             application.main(args)
         if not finished or any(tasks != set(range(10)) for tasks in closed.values()):
             raise ValueError('Incomplete experimental final-stage coverage')
         save_new(destination / 'final_stats.json', final_stats)
         save_new(destination / 'timing.json', dict(final_pass_seconds=timings,
                  scope='Instrumented final-pass wall times, not method overhead. Full rebuild '
-                       'and earlier stages are only included in the parent subprocess timer.'))
+                 'and earlier stages are only included in the parent subprocess timer.'))
         print('LOGIC_HISTORICAL_ROWS_EXACT=PASS_BOTH_ARMS', flush=True)
     finally:
         engine.start_trace, trainer.evaluate_till_now = old_start, old_evaluate
@@ -155,12 +166,13 @@ def run_probe(history, destination, application_args):
         utils.cleanup_distributed()
 
 
-def summarize(history, destination):
+def summarize(history, destination, spec=None):
     """Validate every trace and report task-balanced, paired experimental changes."""
+    spec = spec or variants
     headers, samples = {}, {}
     files = ['task_%02d.jsonl' % t for t in range(10)]
     old_headers, old_samples = {}, {}
-    for arm in variants.ARMS:
+    for arm in spec.ARMS:
         folder = destination / arm
         if sorted(p.name for p in folder.glob('task_*.jsonl')) != files:
             raise ValueError('Incomplete experiment traces: ' + arm)
@@ -181,8 +193,8 @@ def summarize(history, destination):
     invariants = ('index', 'target', 'true_task', 'input_sha256', 'tii_task',
                   'proposal_before', 'initial_logits_sha256', 'rp_sha256', 'rp_class')
     report = {}
-    for arm in variants.ARMS:
-        control = 'full' if variants.ARMS[arm][0] == .7 else 'class_gate'
+    for arm in spec.ARMS:
+        control = 'full' if spec.ARMS[arm][0] == .7 else 'class_gate'
         for task, (head, rows) in enumerate(zip(headers[arm], samples[arm])):
             reference = old_headers['full'][task]
             for key in ('dataset', 'seed', 'stage', 'eval_task', 'samples', 'class_mask'):
@@ -190,11 +202,11 @@ def summarize(history, destination):
                     raise ValueError('Arm header mismatch: ' + key)
             if head['run']['common'] != headers['full'][task]['run']['common']:
                 raise ValueError('Arm provenance differs')
-            check_arm_configuration(head['configuration'], reference['configuration'], arm)
+            check_arm_configuration(head['configuration'], reference['configuration'], arm, spec)
             for row, before in zip(rows, old_samples[control][task]):
                 if any(row[key] != before[key] for key in (*invariants, 'proposal_after', 'drm_class')):
                     raise ValueError('Experiment changed input/RP/routing/DRM evidence')
-                if not variants.ARMS[arm][2] and any(row[k] != before[k] for k in
+                if not spec.changes_crm(arm) and any(row[k] != before[k] for k in
                         ('crm_class', 'final_adapter', 'crm_evaluated', 'crm_used_alternative')):
                     raise ValueError('Gate-only intervention changed CRM decisions')
         def paired_to(other, stage='final_class'):
@@ -212,17 +224,17 @@ def summarize(history, destination):
                               for r in rows) / len(rows) for rows in samples[arm]),
                           against_original=against)
     routing_effects = {}
-    for label, left, right in (('original', 'class_gate', 'full'),
-                              ('gate_z', 'class_gate_gate_z', 'full_gate_z'),
-                              ('crm_refresh', 'class_gate_crm_refresh', 'full_crm_refresh'),
-                              ('both', 'class_gate_both', 'full_both')):
+    pairs = [('original' if arm == 'full' else arm[5:],
+              'class_gate' + arm[4:], arm) for arm in spec.ARMS if arm.startswith('full')]
+    for label, left, right in pairs:
         routing_effects[label] = stages.paired_stats([[(a['final_class'], b['final_class'], a['target'])
              for a, b in zip(l, r)] for l, r in zip(samples[left], samples[right])])
     return dict(arms=report, conditional_routing=routing_effects,
                 limitations='Exploratory final-stage interventions on an already inspected test set. '
                 'Not held-out validation, not new retention results, not evidence to select a new '
-                'paper default. Controls must reproduce historical rows exactly. All eight arms '
-                'share checkpoints, inputs and RP evidence; record losses as well as gains.')
+                'paper default. Controls must reproduce historical rows exactly. '
+                + ('All eight arms ' if spec is variants else 'All arms ')
+                + 'share checkpoints, inputs and RP evidence; record losses as well as gains.')
 
 
 if __name__ == '__main__':
@@ -230,5 +242,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--history', type=Path, required=True)
     parser.add_argument('--destination', type=Path, required=True)
+    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector'), default='gate_crm')
     options = parser.parse_args(sys.argv[1:separator])
-    run_probe(options.history.resolve(), options.destination.resolve(), sys.argv[separator + 1:])
+    run_probe(options.history.resolve(), options.destination.resolve(), sys.argv[separator + 1:],
+              variant_spec(options.experiment))

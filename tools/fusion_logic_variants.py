@@ -22,6 +22,12 @@ ARMS = {
     'full_both': (.7, True, True),
     'class_gate_both': (1., True, True),
 }
+
+
+def changes_crm(arm):
+    return ARMS[arm][2]
+
+
 ANCHOR = '            corr_id=None\n            re_id = None\n'
 INSERT = (
     '            if task_id > 0:\n'

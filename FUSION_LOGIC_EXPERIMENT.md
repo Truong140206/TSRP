@@ -119,3 +119,51 @@ CPU tests compare the actual experimental evaluator with an independent scalar
 implementation, exercise gate scale invariance and unseen-class masking, check
 the real parser and configuration guards, and replay a synthetic ten-stage run
 followed by all eight final arms. They do not replace the real-image experiment.
+
+## Read completed stage paths without another GPU evaluation
+
+For a completed **default eight-arm** batch containing `ima/seed42` through
+`ima/seed45`, use:
+
+```bash
+python -B tools/audit_fusion_logic_stages.py \
+  --batch-dir /path/to/completed-logic-batch \
+  --output /path/outside-the-batch/stage-report.json
+```
+
+This checks stored trace hashes, recomputes all summary metrics, and counts class
+repairs/harms after DRM, CRM and class fusion. It also reports within-arm changes
+and the paths of final repaired/harmed samples. Equal task weighting and equal
+seed weighting are kept separate from pooled image counts. The saved historical
+control attestation is checked; old GPU execution is not independently repeated.
+No PyTorch import/GPU is required by this analyzer. Output is optional, must be
+outside the input batch, and must not already exist. Class IDs alone cannot
+identify a confidence/calibration cause or the unselected candidate's logits.
+
+## Isolate the CRM selection criterion
+
+Add **`--experiment crm_selector`** to the runner command to evaluate six arms:
+the two unchanged controls, each with `zenergy`, and each with `fused_margin`.
+The original eligibility, candidate list, routing weights and class gate remain
+unchanged. The earlier Gate Z and CRM-refresh interventions are not enabled.
+
+- `zenergy` applies the original energy formula to per-candidate z-standardized
+  seen-class logits. Away from the variance floor it removes positive affine
+  scale and offset dependence of this selector.
+- `fused_margin` computes the existing class fusion for both candidates with the
+  same RP scores, undoes the final affine rescaling, and compares the resulting
+  top-two probability margins. The original primary-margin gate remains in use;
+  therefore this criterion is offset invariant but not generally scale invariant.
+  Temporary fusion config/telemetry is restored before the real final fusion.
+
+Neither is a calibrated probability of correctness. Both can prefer a confidently
+wrong candidate; these experiments do not establish a solution or a new default.
+No target labels enter either criterion. Ties keep the first (current) candidate,
+as in the original selector. No extra ViT forward is needed per selector arm,
+but the experiment runs five additional final-stage evaluations after the Full
+sequence. Keep all six results, including changes relative to original class-gate.
+All input/checkpoint/history checks described above still apply. A new tag is
+required; do not point this at an old eight-arm destination.
+
+These are evaluation-only interventions. The separate CTIRD training experiment
+is described in [CTIRD_ALIGNMENT_EXPERIMENT.md](CTIRD_ALIGNMENT_EXPERIMENT.md).

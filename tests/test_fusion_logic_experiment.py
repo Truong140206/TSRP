@@ -153,10 +153,12 @@ def manifest(folder,arm):
                                                variant=arm,common=dict(source='synthetic'))))
 
 
-def test_full_sequence_replay_and_all_eight_final_arms(monkeypatch,tmp_path):
+@pytest.mark.parametrize('experiment', ['gate_crm', 'crm_selector'])
+def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment):
     import main as application
     import utils
     from trainers import lora_trainer as trainer
+    spec = probe.variant_spec(experiment)
     monkeypatch.setattr(utils,'cleanup_distributed',lambda:None)
     monkeypatch.setattr(engine,'args_ref',[None])
     monkeypatch.setattr(engine,'gate_stats',{})
@@ -178,7 +180,7 @@ def test_full_sequence_replay_and_all_eight_final_arms(monkeypatch,tmp_path):
     history,destination = tmp_path/'history',tmp_path/'new'
     for arm in ('full','class_gate'):
         manifest(history/arm,arm)
-    for arm in variants.ARMS:
+    for arm in spec.ARMS:
         manifest(destination/arm,arm)
     model,orig,device = IndexedAdapters(bank),IndexedOriginal(original),torch.device('cpu')
     for arm,weight in (('full',.7),('class_gate',1.)):
@@ -195,22 +197,44 @@ def test_full_sequence_replay_and_all_eight_final_arms(monkeypatch,tmp_path):
     old_eval,old_start,old_gate,old_till = engine.evaluate,engine.start_trace,engine._fusion_gate,trainer.evaluate_till_now
     monkeypatch.setattr(application,'get_args',lambda:config(tmp_path,destination/'full'))
     monkeypatch.setattr(application,'main',fake_main)
-    probe.run_probe(history,destination,['unused'])
+    probe.run_probe(history,destination,['unused'],spec)
     assert seen == list(range(10))
     assert (engine.evaluate,engine.start_trace,engine._fusion_gate,trainer.evaluate_till_now) == (old_eval,old_start,old_gate,old_till)
-    result=probe.summarize(history,destination)
-    assert set(result['arms']) == set(variants.ARMS)
-    assert set(result['conditional_routing']) == {'original','gate_z','crm_refresh','both'}
+    result=probe.summarize(history,destination,spec)
+    assert set(result['arms']) == set(spec.ARMS)
+    assert set(result['conditional_routing']) == (
+        {'original','gate_z','crm_refresh','both'} if experiment == 'gate_crm'
+        else {'original','zenergy','fused_margin'})
     stats=json.loads((destination/'final_stats.json').read_text())
-    assert len(stats)==7
+    assert len(stats)==len(spec.ARMS)-1
     for arm in stats:
         assert stats[arm]['Acc@1'] == pytest.approx(result['arms'][arm]['task_balanced_accuracy']['final_class'],abs=1e-5)
-    assert set(json.loads((destination/'timing.json').read_text())['final_pass_seconds']) == set(variants.ARMS)
+    assert set(json.loads((destination/'timing.json').read_text())['final_pass_seconds']) == set(spec.ARMS)
+    if experiment == 'gate_crm':
+        from tools import audit_fusion_logic_stages as stage_audit
+        from tools.audit_prediction_stages import sha256
+        stored = dict(result, dataset='Split-Imagenet-A', seed=42,
+            historical_controls='EXACT_TRACE_ROWS_BOTH_ARMS',
+            historical_full_all_stages='PASS_AT_1e-4_LOG_PRECISION',
+            trace_sha256={str(p.relative_to(destination)).replace('\\','/'):sha256(p)
+                          for p in destination.glob('*/task_*.jsonl')})
+        summary_path = destination/'summary.json'
+        summary_path.write_text(json.dumps(stored),encoding='utf-8')
+        before = {p:p.read_bytes() for p in destination.rglob('*') if p.is_file()}
+        stage_result = stage_audit.audit(destination)
+        assert set(stage_result['conditions']) == {'original','gate_z','crm_refresh','both'}
+        for name, values in stage_result['conditions'].items():
+            assert values['stage_pairs']['final_class'] == result['conditional_routing'][name]
+        assert {p:p.read_bytes() for p in before} == before
+        stored['arms']['full']['task_balanced_accuracy']['final_class'] += 1
+        summary_path.write_text(json.dumps(stored),encoding='utf-8')
+        with pytest.raises(ValueError,match='summary mismatch'):
+            stage_audit.audit(destination)
     # No silent partial/mutated trace acceptance.
-    path=destination/'full_both'/'task_00.jsonl'
+    path=destination/list(spec.ARMS)[-1]/'task_00.jsonl'
     path.write_text(path.read_text().replace('"rp_sha256":','"bad_rp_sha256":',1))
     with pytest.raises(ValueError,match='checksum'):
-        probe.summarize(history,destination)
+        probe.summarize(history,destination,spec)
 
 
 @pytest.mark.parametrize('problem',[None,'seed','source','checkpoints','runtime','data','config','missing_config'])
