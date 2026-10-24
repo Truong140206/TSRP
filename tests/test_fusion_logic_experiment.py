@@ -183,6 +183,16 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         bank[1,1,20] = 3.
         bank[1,0,0],bank[1,0,1] = 1.,.9
         rp[1,1] = 100.
+        # A distinct task-1 case exercises accepting a new adapter whose
+        # primary head and RP agree, while class-gate predicts class 0.
+        original[2] = -10.
+        original[2,40] = 10.
+        bank[2] = 0.
+        rp[2] = 0.
+        bank[2,2,0],bank[2,2,20] = 2.,1.9
+        bank[2,0,0] = 3.
+        bank[2,1,20] = 1.
+        rp[2,20] = 100.
     monkeypatch.setattr(engine,'rp_head_predict',lambda features,*a:rp[features[:,0].long()].clone())
     loaders,offset = [],0
     for t,count in enumerate(sizes):
@@ -301,6 +311,24 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         assert factorial_report['original_correctness_strata']['full_harmed']['samples']>=4
         assert factorial_report['original_correctness_strata']['full_repaired']['samples']>=4
         assert all(p.read_bytes()==contents for p,contents in before.items())
+        from tools import analyze_route_acceptance as acceptance
+        acceptance_path=tmp_path/'acceptance.json'
+        acceptance_command=[sys.executable,'-B','-S',str(Path(acceptance.__file__)),
+                            '--batch-dir',str(batch),'--output',str(acceptance_path)]
+        acceptance_cli=subprocess.run(acceptance_command,capture_output=True,text=True,timeout=60)
+        assert acceptance_cli.returncode==0, acceptance_cli.stdout+acceptance_cli.stderr
+        assert 'ROUTE_ACCEPTANCE_COMPLETE=4/4' in acceptance_cli.stdout
+        accepted=json.loads(acceptance_path.read_text())
+        assert accepted['status']=='POST_HOC_EXPLORATORY_NOT_VALIDATED'
+        assert len(accepted['input_sha256'])==164
+        assert len(accepted['decisions'])==accepted['aggregate']['counts']['samples']==4*n
+        assert accepted['aggregate']['counts']['retained_full_repairs']>=4
+        assert accepted['aggregate']['counts']['rejected_full_repairs']>=4
+        assert accepted['aggregate']['counts']['avoided_full_harms']>=4
+        for arm in ('class_gate','full'):
+            assert accepted['aggregate']['equal_seed_task_balanced_accuracy'][arm]==pytest.approx(
+                result['arms'][arm]['task_balanced_accuracy']['final_class'])
+        assert all(p.read_bytes()==contents for p,contents in before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
         corrupt.write_text(original+' ')
@@ -314,6 +342,10 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
                                 capture_output=True,text=True,timeout=60)
         assert rejected.returncode != 0 and 'FUSION_FACTORIAL_STOP' in rejected.stderr
         assert not (tmp_path/'rejected_factorial.json').exists()
+        rejected=subprocess.run(acceptance_command[:-1]+[str(tmp_path/'rejected_acceptance.json')],
+                                capture_output=True,text=True,timeout=60)
+        assert rejected.returncode!=0 and 'ROUTE_ACCEPTANCE_STOP' in rejected.stderr
+        assert not (tmp_path/'rejected_acceptance.json').exists()
         corrupt.write_text(original)
         score_path=destination/'full'/'candidate_task_00.json'
         good=score_path.read_text()

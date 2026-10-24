@@ -164,3 +164,52 @@ Crossed weights require information from both saved evaluation paths; the
 report is a conditional diagnostic, not an inference rule with demonstrated
 cost or a validated improvement. It covers final-stage accuracy, not a new
 retention curve. No defaults or manuscript results are changed.
+
+## Exploratory acceptance of the routing proposal
+
+This is a single fixed hypothesis, formulated **after** inspecting ImageNet-A
+test diagnostics. It is not a validated improvement and must not replace paper
+results on the strength of the same test set.
+
+Start from the saved class-gate path. Accept the saved Full path only when its
+final selected adapter differs and its primary classifier and the RP classifier
+have the same numerically clear top class. Otherwise retain class-gate. Near
+ties use the existing numerical tolerance and fall back to class-gate. Neither
+fusion formula nor its weights are changed. Both heads can agree on a wrong
+class, and this strict rule can reject beneficial RP corrections; both failure
+modes are included in tests and reported counts.
+
+The pure `choose_path` function receives only two adapter IDs, the proposed
+primary scores and the RP scores. It receives no target, true task, image ID,
+seed, or correctness information. There is no parameter sweep, fitting or
+outcome-based choice of rules within the run. This does **not** remove the
+post-hoc nature of the research design.
+
+```bash
+python -B -S -u -m tools.analyze_route_acceptance \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/route_acceptance_new.json
+```
+
+It verifies all four original captures and evaluates this decision over every
+stored final-stage sample on CPU. The output distinguishes accepted proposals,
+changed final classes, repairs/harms, retained/rejected Full gains and
+avoided/accepted Full harms. Original controls must match exactly. All input
+hashes are checked before and after; output is a new file outside the batch.
+
+`ROUTE_ACCEPTANCE_COMPLETE=4/4` is a completed exploratory report. Labels enter
+only accuracy accounting after the path is selected. The model and normal
+evaluator are not changed; no GPU or additional forward is used by this offline
+tool. A live implementation would need access to both paths and may incur
+additional inference cost, which is not measured here. Intermediate stages and
+retention have not been evaluated by this tool.
+
+In the current ImageNet-A pipeline, `datasets.py` creates `dataset_val` with
+`train=False`, and `Imagenet_A` reads `imagenet-a/test` for that setting. Thus
+the loader name `val` does not identify an independent calibration split. No
+reserved validation split for these checkpoints has been established by this
+audit. Different seeds on the same test images are not held-out validation.
+An independent validation protocol is needed before selecting or claiming a
+new method, including checking that calibration images were not previously
+used to fit its adapters/RP head. The source hash and named rule are saved in
+the report for subsequent reproducible checks on other data.
