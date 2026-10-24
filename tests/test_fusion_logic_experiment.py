@@ -153,7 +153,7 @@ def manifest(folder,arm):
                                                variant=arm,common=dict(source='synthetic'))))
 
 
-@pytest.mark.parametrize('experiment', ['gate_crm', 'crm_selector'])
+@pytest.mark.parametrize('experiment', ['gate_crm', 'crm_selector', 'crm_diagnostics'])
 def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment):
     import main as application
     import utils
@@ -202,9 +202,68 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
     assert (engine.evaluate,engine.start_trace,engine._fusion_gate,trainer.evaluate_till_now) == (old_eval,old_start,old_gate,old_till)
     result=probe.summarize(history,destination,spec)
     assert set(result['arms']) == set(spec.ARMS)
-    assert set(result['conditional_routing']) == (
-        {'original','gate_z','crm_refresh','both'} if experiment == 'gate_crm'
-        else {'original','zenergy','fused_margin'})
+    assert set(result['conditional_routing']) == {
+        'gate_crm':{'original','gate_z','crm_refresh','both'},
+        'crm_selector':{'original','zenergy','fused_margin'},
+        'crm_diagnostics':{'original'},
+    }[experiment]
+    if experiment == 'crm_diagnostics':
+        diagnostics = spec.summarize_candidates(destination,result)
+        assert set(diagnostics['arms']) == {'full','class_gate'}
+        assert len(diagnostics['score_sha256']) == 20
+        for arm in diagnostics['arms']:
+            counts = diagnostics['arms'][arm]['counts']
+            assert counts['samples'] == n
+            assert sum(counts[k] for k in ('both_candidates_correct','both_candidates_wrong',
+                'selected_wrong_other_correct','selected_correct_other_wrong')) == counts['crm_evaluated']
+            assert counts['fusion_harmed_rp_correct'] == 0
+        # A real four-directory CPU aggregation, with independently verified
+        # trace identities, counts, scores and saved completion metadata.
+        import shutil
+        from tools.audit_prediction_stages import sha256
+        batch=tmp_path/'batch'
+        for seed in (42,43,44,45):
+            folder=batch/'ima'/('seed%d'%seed)
+            shutil.copytree(destination,folder)
+            for arm in spec.ARMS:
+                for task in range(10):
+                    trace=folder/arm/('task_%02d.jsonl'%task)
+                    lines=trace.read_text().splitlines(keepends=True)
+                    header=json.loads(lines[0])
+                    header['seed']=header['configuration']['seed']=header['run']['seed']=seed
+                    lines[0]=json.dumps(header)+'\n'
+                    trace.write_text(''.join(lines))
+                    candidate=folder/arm/('candidate_task_%02d.json'%task)
+                    saved=json.loads(candidate.read_text())
+                    saved['trace_header']={k:v for k,v in header.items() if k not in ('type','schema')}
+                    candidate.write_text(json.dumps(saved))
+            stored=dict(result,dataset='Split-Imagenet-A',seed=seed,
+                provenance={'experiment':'crm_candidate_scores_observer_v1'},
+                historical_controls='EXACT_TRACE_ROWS_BOTH_ARMS',
+                historical_full_all_stages='PASS_AT_1e-4_LOG_PRECISION',
+                trace_sha256={p.relative_to(folder).as_posix():sha256(p) for p in folder.glob('*/task_*.jsonl')})
+            stored['candidate_diagnostics']=spec.summarize_candidates(folder,stored)
+            (folder/'summary.json').write_text(json.dumps(stored))
+        before={p:p.read_bytes() for p in batch.rglob('*') if p.is_file()}
+        aggregate=spec.audit_batch(batch)
+        assert aggregate['aggregate']['full']['repeated_prediction_counts']['samples']==4*n
+        assert aggregate['aggregate']['full']['equal_seed_task_balanced_pp']['actual_correct']==pytest.approx(
+            result['arms']['full']['task_balanced_accuracy']['final_class'])
+        assert all(p.read_bytes()==contents for p,contents in before.items())
+        corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
+        original=corrupt.read_text()
+        corrupt.write_text(original+' ')
+        with pytest.raises(ValueError,match='summary mismatch'):
+            spec.audit_batch(batch)
+        corrupt.write_text(original)
+        score_path=destination/'full'/'candidate_task_00.json'
+        good=score_path.read_text()
+        changed=json.loads(good)
+        changed['samples'][0]['selected']=1-changed['samples'][0]['selected']
+        score_path.write_text(json.dumps(changed))
+        with pytest.raises(ValueError,match='selection mismatch'):
+            spec.summarize_candidates(destination,result)
+        score_path.write_text(good)
     stats=json.loads((destination/'final_stats.json').read_text())
     assert len(stats)==len(spec.ARMS)-1
     for arm in stats:

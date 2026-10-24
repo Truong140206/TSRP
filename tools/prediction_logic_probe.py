@@ -29,6 +29,9 @@ def variant_spec(name):
     if name == 'crm_selector':
         from tools import crm_selector_variants
         return crm_selector_variants
+    if name == 'crm_diagnostics':
+        from tools import crm_candidate_probe
+        return crm_candidate_probe
     raise ValueError('Unknown experiment: ' + name)
 
 

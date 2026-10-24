@@ -3,6 +3,7 @@
 One historical Full reconstruction plus remaining final-stage evaluations.
 Default: eight gate/CRM arms. --experiment crm_selector: six selector arms. Never
 overwrite historical data, retrain adapters or change the normal evaluator.
+--experiment crm_diagnostics: observe both CRM candidates in the two controls.
 """
 import argparse
 import importlib.metadata
@@ -60,7 +61,7 @@ def main():
     parser.add_argument('--seed', type=int, choices=(42, 43, 44, 45), required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--run', action='store_true')
-    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector'), default='gate_crm')
+    parser.add_argument('--experiment', choices=('gate_crm', 'crm_selector', 'crm_diagnostics'), default='gate_crm')
     args = parser.parse_args()
     spec = probe.variant_spec(args.experiment)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.tag):
@@ -106,8 +107,10 @@ def main():
     drivers = {p.name: stages.sha256(p) for p in sorted((ROOT / 'tools').glob('*.py'))}
     common = dict(source_sha256=source, drivers=drivers, checkpoints=records,
                   runtime=runtime, dataset_path=str(args.resolved_data_path),
-                  experiment=('gate_zscore_and_post_drm_crm_v1' if args.experiment == 'gate_crm'
-                              else 'fixed_candidates_crm_selectors_v1'), settings=spec.ARMS,
+                  experiment={'gate_crm':'gate_zscore_and_post_drm_crm_v1',
+                              'crm_selector':'fixed_candidates_crm_selectors_v1',
+                              'crm_diagnostics':'crm_candidate_scores_observer_v1'}[args.experiment],
+                  settings=spec.ARMS,
                   historical_sha256=histories)
     print('LOGIC_PREFLIGHT=PASS; NO_ADAPTER_TRAINING; %d final arms' % len(spec.ARMS), flush=True)
     print('DESTINATION=' + str(destination), flush=True)
@@ -137,6 +140,8 @@ def main():
                                    base.verify.CORE + base.verify.RETENTION, label='LOGIC_HISTORICAL_FULL'):
             raise ValueError('Full sequence differs; do not interpret experimental results')
         report = probe.summarize(args.history, destination, spec)
+        if args.experiment == 'crm_diagnostics':
+            report['candidate_diagnostics'] = spec.summarize_candidates(destination, report)
         stats = json.loads((destination / 'final_stats.json').read_text(encoding='utf-8'))
         for arm, values in stats.items():
             if abs(values['Acc@1'] - report['arms'][arm]['task_balanced_accuracy']['final_class']) > .00011:
@@ -160,6 +165,10 @@ def main():
                 versus_old_class_gate=values['against_original']['class_gate']['task_balanced_net_pp'])), flush=True)
         print('LOGIC_ROUTING_EFFECTS=' + json.dumps({k: v['task_balanced_net_pp']
               for k, v in report['conditional_routing'].items()}), flush=True)
+        if args.experiment == 'crm_diagnostics':
+            print('CRM_CANDIDATE_COUNTS=' + json.dumps({arm: values['counts']
+                  for arm, values in report['candidate_diagnostics']['arms'].items()}), flush=True)
+            print('CRM_CANDIDATE_AUDIT_COMPLETE=1/1', flush=True)
         print('LOGIC_EXPERIMENT_COMPLETE=1/1', flush=True)
         print('SUMMARY=' + str(destination / 'summary.json'), flush=True)
 
