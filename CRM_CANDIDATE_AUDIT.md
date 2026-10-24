@@ -124,3 +124,43 @@ prediction occurrences repeated across seeds. Label-based thresholds and swaps
 on selected errors are diagnostic counterfactuals, not new dataset accuracy,
 validation of a different gate or a rule for choosing test-time weights. No
 paper, default algorithm or historical result is rewritten.
+
+## Full-data 2-by-2 score/gate analysis (CPU only)
+
+To separate the conditional contributions of the selected adapter scores and
+the gate weight, analyze **every** final-stage sample, including those where
+both original arms are correct or both are wrong:
+
+```bash
+python -B -S -u -m tools.analyze_fusion_factorial \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/factorial_new.json
+```
+
+| Output cell | Primary scores after CRM, before fusion | Effective per-image RP weight |
+|---|---|---|
+| `cg_scores_cg_gate` | Class-gate | Class-gate |
+| `full_scores_full_gate` | Full | Full |
+| `full_scores_cg_gate` | Full | Class-gate |
+| `cg_scores_full_gate` | Class-gate | Full |
+
+All four cells use the identical captured RP vector for each paired image. The
+two original controls must reproduce recorded classes, task counts and
+task-balanced accuracy. This does not fuse already-fused scores a second time,
+change candidate selection, or fit any parameters. It never loads a model.
+
+Reports include each seed, equal-task/equal-seed means, paired repairs/harms,
+the original four correctness strata, and the 2-by-2 interaction. Counts repeat
+images across seeds; pooled counts must not replace task-balanced accuracy.
+The crossed cells may create new errors or repairs outside the previously
+reported 48 paired changes. Original control tie decisions are taken from the
+verified traces. Numerically ambiguous crossed predictions are reported with
+correctness and accuracy bounds rather than an arbitrary tie break; these
+bounds are **not** statistical confidence intervals.
+
+`FUSION_FACTORIAL_COMPLETE=4/4` confirms completion and unchanged input hashes.
+The new output must be outside the input batch and cannot overwrite a file.
+Crossed weights require information from both saved evaluation paths; the
+report is a conditional diagnostic, not an inference rule with demonstrated
+cost or a validated improvement. It covers final-stage accuracy, not a new
+retention curve. No defaults or manuscript results are changed.

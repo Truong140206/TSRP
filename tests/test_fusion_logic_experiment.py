@@ -284,6 +284,23 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         assert report['groups']['paired_repaired']['samples'] >= 4
         assert report['groups']['paired_harmed_full_fusion_harmed']['samples'] >= 4
         assert all(p.read_bytes()==contents for p,contents in before.items())
+        from tools import analyze_fusion_factorial as factorial
+        factorial_path=tmp_path/'factorial.json'
+        factorial_command=[sys.executable,'-B','-S',str(Path(factorial.__file__)),
+                           '--batch-dir',str(batch),'--output',str(factorial_path)]
+        factorial_cli=subprocess.run(factorial_command,capture_output=True,text=True,timeout=60)
+        assert factorial_cli.returncode==0, factorial_cli.stdout+factorial_cli.stderr
+        assert 'FUSION_FACTORIAL_COMPLETE=4/4' in factorial_cli.stdout
+        factorial_report=json.loads(factorial_path.read_text())
+        assert len(factorial_report['input_sha256'])==164
+        assert factorial_report['aggregate']['repeated_prediction_counts']['samples']==4*n
+        for arm,cell in factorial.CONTROLS.items():
+            assert factorial_report['aggregate']['equal_seed_task_balanced_accuracy'][cell]['value']==pytest.approx(
+                result['arms'][arm]['task_balanced_accuracy']['final_class'])
+        assert sum(v['samples'] for v in factorial_report['original_correctness_strata'].values())==4*n
+        assert factorial_report['original_correctness_strata']['full_harmed']['samples']>=4
+        assert factorial_report['original_correctness_strata']['full_repaired']['samples']>=4
+        assert all(p.read_bytes()==contents for p,contents in before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
         corrupt.write_text(original+' ')
@@ -293,6 +310,10 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         rejected=subprocess.run(failed_command,capture_output=True,text=True,timeout=60)
         assert rejected.returncode != 0 and 'CRM_ERROR_ANALYSIS_STOP' in rejected.stderr
         assert not (tmp_path/'rejected_analysis.json').exists()
+        rejected=subprocess.run(factorial_command[:-1]+[str(tmp_path/'rejected_factorial.json')],
+                                capture_output=True,text=True,timeout=60)
+        assert rejected.returncode != 0 and 'FUSION_FACTORIAL_STOP' in rejected.stderr
+        assert not (tmp_path/'rejected_factorial.json').exists()
         corrupt.write_text(original)
         score_path=destination/'full'/'candidate_task_00.json'
         good=score_path.read_text()
