@@ -83,3 +83,44 @@ Counts repeat images across seeds. Report-only alternative selections are not
 held-out validation, new performance results or an independently deployable
 selector. The audit also is not a timing benchmark, and it does not produce a
 new class-gate retention curve.
+
+## Inspect paired class errors from saved scores (CPU only)
+
+After the four-seed candidate audit finishes, the following command reads its
+existing captures. It does not load a model, train, evaluate again or use a GPU.
+The output must be a new file outside the input batch, in an existing directory.
+
+```bash
+python -B -S -m tools.analyze_crm_candidate_errors \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/crm_error_analysis_new.json
+```
+
+The command verifies all four stored reports, trace identities and score hashes
+using the existing candidate auditor. It checks the 164 input files again after
+analysis. It examines both directions of paired final-class changes, comparing
+the selected primary logits, gate margin, effective RP weight and duplicate
+candidate adapters. Within each pair, both arms compare the true class with the
+**same wrong final class**, rather than comparing the target with a primary winner
+that may already be the target (which would give an uninformative zero gap).
+
+For standardized primary gap `P` and RP gap `R`, the true-minus-rival fused gap is
+`(1 - beta) * P + beta * R`. The report solves this inequality against **every**
+other class to obtain the interval in which the target is a maximum. It reports
+both `[0, 1]` and the original gate's allowed `[0, 0.5]` domain. Interval endpoints
+may be ties; they do not guarantee a uniquely correct prediction. Saved float32
+scores are reconstructed in Python double precision, and numerical near ties
+in weight-swap predictions are marked ambiguous.
+
+The report also swaps the two arms' effective RP weights while keeping their
+selected primary scores and the shared RP scores fixed. No CRM choice is
+recomputed. For the chosen rival, an ordered arithmetic decomposition separates
+the primary-gap change at the class-gate weight from the weight change on Full's
+primary scores. These are not independent causal effects; changing the order of
+this decomposition changes the component values.
+
+`CRM_ERROR_ANALYSIS_COMPLETE=4/4` and `REPORT=...` indicate completion. Counts are
+prediction occurrences repeated across seeds. Label-based thresholds and swaps
+on selected errors are diagnostic counterfactuals, not new dataset accuracy,
+validation of a different gate or a rule for choosing test-time weights. No
+paper, default algorithm or historical result is rewritten.

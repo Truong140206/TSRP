@@ -168,6 +168,21 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
     original = torch.randn(n,200,generator=generator)
     bank = torch.randn(n,10,200,generator=generator)
     rp = torch.randn(n,200,generator=generator)
+    if experiment == 'crm_diagnostics':
+        # Known paired changes on task 0: Full loses class 0 after fusion and
+        # repairs class 1. The remaining samples retain the random fixture.
+        original[:2] = -10.
+        original[:2,40] = 10.
+        bank[:2] = 0.
+        rp[:2] = 0.
+        bank[0,2,0],bank[0,2,20] = 2.,1.9
+        bank[0,0,0] = 3.
+        bank[0,1,0],bank[0,1,20] = 1.,.9
+        rp[0,20] = 100.
+        bank[1,2,20],bank[1,2,0] = 2.,1.9
+        bank[1,1,20] = 3.
+        bank[1,0,0],bank[1,0,1] = 1.,.9
+        rp[1,1] = 100.
     monkeypatch.setattr(engine,'rp_head_predict',lambda features,*a:rp[features[:,0].long()].clone())
     loaders,offset = [],0
     for t,count in enumerate(sizes):
@@ -250,11 +265,34 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         assert aggregate['aggregate']['full']['equal_seed_task_balanced_pp']['actual_correct']==pytest.approx(
             result['arms']['full']['task_balanced_accuracy']['final_class'])
         assert all(p.read_bytes()==contents for p,contents in before.items())
+        # Exercise the real stdlib-only score-analysis entry point on a complete
+        # four-seed capture, including persisted output and input immutability.
+        from tools import analyze_crm_candidate_errors as error_analysis
+        import subprocess
+        import sys
+        report_path=tmp_path/'error_analysis.json'
+        command=[sys.executable,'-B','-S',str(Path(error_analysis.__file__)),
+                 '--batch-dir',str(batch),'--output',str(report_path)]
+        cli=subprocess.run(command,capture_output=True,text=True,timeout=60)
+        assert cli.returncode == 0, cli.stdout+cli.stderr
+        assert 'CRM_ERROR_ANALYSIS_COMPLETE=4/4' in cli.stdout
+        report=json.loads(report_path.read_text())
+        assert report['verification']=='FOUR_SEEDS_RECOMPUTED_AND_INPUT_FILES_UNCHANGED'
+        assert len(report['input_sha256'])==164
+        assert len(report['cases'])==sum(len(s['paired_class_changes']) for s in aggregate['seeds'].values())
+        assert report['groups']['paired_harmed']['samples'] >= 4
+        assert report['groups']['paired_repaired']['samples'] >= 4
+        assert report['groups']['paired_harmed_full_fusion_harmed']['samples'] >= 4
+        assert all(p.read_bytes()==contents for p,contents in before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
         corrupt.write_text(original+' ')
         with pytest.raises(ValueError,match='summary mismatch'):
             spec.audit_batch(batch)
+        failed_command=command[:-1]+[str(tmp_path/'rejected_analysis.json')]
+        rejected=subprocess.run(failed_command,capture_output=True,text=True,timeout=60)
+        assert rejected.returncode != 0 and 'CRM_ERROR_ANALYSIS_STOP' in rejected.stderr
+        assert not (tmp_path/'rejected_analysis.json').exists()
         corrupt.write_text(original)
         score_path=destination/'full'/'candidate_task_00.json'
         good=score_path.read_text()
