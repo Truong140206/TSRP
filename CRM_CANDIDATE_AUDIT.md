@@ -268,3 +268,35 @@ It does not validate a new selector, evaluate retention or measure the live cost
 of retaining more candidates. A later method would require a valid selection
 protocol, comparison at the same inference budget and evaluation beyond the
 test diagnostics used to develop it.
+
+### Diagnose a same-adapter score mismatch
+
+If the strict union stops with `Same adapter has different scores`, do not
+increase the tolerance or merge those records without examining the difference.
+Run the separate diagnostic mode on the same input batch and a new output file:
+
+```bash
+python -B -S -u -m tools.analyze_candidate_union \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/duplicate_diagnostic_new.json \
+  --diagnose-duplicates
+```
+
+It retains the original capture checks and inspects every unordered pair of
+recorded occurrences with the same adapter ID, both within and across arms.
+Primary and fused differences are reported separately: maximum absolute
+difference, maximum ratio to the **unchanged** tolerance, affected coordinates,
+standardized-vector difference, top classes, primary top-two gap, and effective
+RP weight. Origin arm, candidate slot and selected status identify which paths
+are being compared. Counts distinguish score mismatches from class changes.
+
+The JSON keeps every rejected pair; the console shows counts for all four seeds,
+the first rejected pair and the largest tolerance violations. Examples are not
+selected according to correctness. This mode does not merge scores, compute a
+candidate union or produce a new accuracy. Differences alone cannot establish
+whether the cause is floating-point execution, model behaviour or observation.
+
+`CANDIDATE_DUPLICATE_DIAGNOSTIC_COMPLETE=4/4` confirms this separate diagnostic,
+not successful completion of the union. The ordinary union command retains its
+strict guards. All input hashes must remain unchanged and the new report must
+stay outside the input batch. No GPU evaluation or training is performed.

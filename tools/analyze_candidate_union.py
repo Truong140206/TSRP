@@ -7,6 +7,7 @@ import argparse
 from contextlib import redirect_stdout
 import hashlib
 import io
+from itertools import combinations
 import json
 import math
 from pathlib import Path
@@ -20,6 +21,7 @@ if str(ROOT) not in sys.path:
 from tools import crm_candidate_probe as capture
 from tools.analyze_crm_candidate_errors import input_snapshot, SEEDS
 from tools.analyze_fusion_factorial import load_records
+from tools.prediction_score_probe import normalized
 
 EVENTS = (
     'cg_actual_correct', 'full_actual_correct', 'final_output_oracle_correct',
@@ -35,6 +37,128 @@ EVENTS = (
 )
 SIZES = ('cg_unique', 'full_unique', 'union_unique', 'shared', 'added_full',
          'removed_cg', 'cg_duplicate_slots', 'full_duplicate_slots')
+
+
+def vector_difference(left, right):
+    """Describe the existing tolerance; never change it to pass a capture."""
+    if (len(left) != len(right) or len(left) < 2
+            or not all(math.isfinite(v) for v in (*left,*right))):
+        raise ValueError('Expected matching finite duplicate score vectors')
+    differences=[abs(a-b) for a,b in zip(left,right)]
+    tolerances=[1e-5+1e-6*max(abs(a),abs(b)) for a,b in zip(left,right)]
+    ratios=[d/t for d,t in zip(differences,tolerances)]
+    worst_abs=max(range(len(left)),key=differences.__getitem__)
+    worst_ratio=max(range(len(left)),key=ratios.__getitem__)
+    lz,lmean,lstd=normalized(left)
+    rz,rmean,rstd=normalized(right)
+    def point(index):
+        return dict(class_index=index,left=left[index],right=right[index],
+            abs_difference=differences[index],tolerance=tolerances[index],ratio=ratios[index])
+    return dict(within_existing_tolerance=capture.vector_close(left,right),
+        max_abs_difference=max(differences),mean_abs_difference=statistics.mean(differences),
+        max_tolerance_ratio=max(ratios),coordinates_exceeding_tolerance=sum(r>1 for r in ratios),
+        worst_absolute_coordinate=point(worst_abs),worst_tolerance_coordinate=point(worst_ratio),
+        standardized_max_abs_difference=max(abs(a-b) for a,b in zip(lz,rz)),
+        left_mean=lmean,right_mean=rmean,left_std=lstd,right_std=rstd)
+
+
+def duplicate_comparisons(full, cg):
+    """All same-adapter occurrence pairs, without collapsing their scores."""
+    if (any(full['sample'][k] != cg['sample'][k]
+            for k in ('target','index','input_sha256')) or full['rp_scores'] != cg['rp_scores']):
+        raise ValueError('Paired inputs/labels/RP differ')
+    groups={}
+    for arm,record in (('class_gate',cg),('full',full)):
+        for slot,candidate in enumerate(record['candidates']):
+            top=sorted(candidate['primary_logits'],reverse=True)[:2]
+            gap=top[0]-top[1]
+            ratio=math.exp(-gap)
+            origin=dict(arm=arm,slot=slot,selected=slot==record['selected'],
+                role='current' if slot==0 else 'alternative',
+                primary_class=candidate['primary_class'],fused_class=candidate['fused_class'],
+                primary_top2_gap=gap,effective_rp_weight=ratio/(1+ratio))
+            groups.setdefault(candidate['adapter'],[]).append((origin,candidate))
+    comparisons=[]
+    for adapter,occurrences in sorted(groups.items()):
+        for (left,a),(right,b) in combinations(occurrences,2):
+            primary=vector_difference(a['primary_logits'],b['primary_logits'])
+            fused=vector_difference(a['fused_logits'],b['fused_logits'])
+            score_mismatch=not (primary['within_existing_tolerance'] and fused['within_existing_tolerance'])
+            prediction_mismatch=any(a[k]!=b[k] for k in ('primary_class','fused_class'))
+            comparisons.append(dict(adapter=adapter,left=left,right=right,primary=primary,fused=fused,
+                score_mismatch=score_mismatch,prediction_mismatch=prediction_mismatch,
+                strict_reject=score_mismatch or prediction_mismatch,
+                primary_class_changed=a['primary_class']!=b['primary_class'],
+                fused_class_changed=a['fused_class']!=b['fused_class'],
+                cross_arm=left['arm']!=right['arm']))
+    return comparisons
+
+
+def diagnose_duplicates(root):
+    """Complete a separate forensic report while strict union stays blocked."""
+    root=Path(root).resolve()
+    before=input_snapshot(root)
+    with redirect_stdout(io.StringIO()):
+        verified=capture.audit_batch(root)
+    print('CRM_CANDIDATE_ALL_SEEDS_VERIFIED=4/4',flush=True)
+    totals=dict(samples=0,samples_with_strict_reject=0,duplicate_pairs=0,
+        score_mismatch_pairs=0,primary_score_mismatch_pairs=0,fused_score_mismatch_pairs=0,
+        prediction_mismatch_pairs=0,primary_class_changed_pairs=0,fused_class_changed_pairs=0,
+        strict_reject_pairs=0,within_arm_pairs=0,cross_arm_pairs=0)
+    maxima=dict(primary_max_abs_difference=0.,fused_max_abs_difference=0.,
+        primary_max_tolerance_ratio=0.,fused_max_tolerance_ratio=0.)
+    seeds,cases={},[]
+    for seed in SEEDS:
+        counts=dict.fromkeys(totals,0)
+        folder=root/'ima'/('seed%d'%seed)
+        evidence=verified['seeds'][seed]
+        for task in range(10):
+            records={arm:load_records(folder,arm,task,evidence['score_sha256'][arm+'/candidate_task_%02d.json'%task])
+                     for arm in ('class_gate','full')}
+            if records['full'].keys()!=records['class_gate'].keys():
+                raise ValueError('Paired sample indices differ')
+            for index in sorted(records['full']):
+                full,cg=records['full'][index],records['class_gate'][index]
+                comparisons=duplicate_comparisons(full,cg)
+                counts['samples']+=1
+                counts['samples_with_strict_reject']+=int(any(c['strict_reject'] for c in comparisons))
+                for comparison in comparisons:
+                    counts['duplicate_pairs']+=1
+                    counts['cross_arm_pairs' if comparison['cross_arm'] else 'within_arm_pairs']+=1
+                    for key in ('score_mismatch','prediction_mismatch','primary_class_changed','fused_class_changed','strict_reject'):
+                        counts[key+'_pairs']+=int(comparison[key])
+                    for key in ('primary','fused'):
+                        counts[key+'_score_mismatch_pairs']+=int(not comparison[key]['within_existing_tolerance'])
+                        for metric in ('max_abs_difference','max_tolerance_ratio'):
+                            maxima[key+'_'+metric]=max(maxima[key+'_'+metric],comparison[key][metric])
+                    if comparison['strict_reject']:
+                        cases.append(dict(seed=seed,eval_task=task,index=index,
+                            input_sha256=cg['sample']['input_sha256'],target=cg['sample']['target'],
+                            actual_final_classes={arm:record['sample']['final_class']
+                                for arm,record in (('class_gate',cg),('full',full))},**comparison))
+        seeds[seed]=counts
+        for key in totals:
+            totals[key]+=counts[key]
+        print('DUPLICATE_DIAGNOSTIC_SEED='+json.dumps(dict(seed=seed,counts=counts)),flush=True)
+    if input_snapshot(root)!=before:
+        raise ValueError('Input files changed during duplicate diagnosis')
+    if len(cases)!=totals['strict_reject_pairs']:
+        raise ValueError('Duplicate diagnostic accounting mismatch')
+    worst=sorted(cases,key=lambda c:max(c['primary']['max_tolerance_ratio'],c['fused']['max_tolerance_ratio']),reverse=True)
+    examples=cases[:1]+[c for c in worst if not cases or c is not cases[0]][:4]
+    return dict(schema=1,status='DUPLICATE_DIAGNOSTIC_ONLY_UNION_NOT_COMPUTED',batch_dir=str(root),
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),input_sha256=before,
+        verification='FOUR_ORIGINAL_CAPTURES_VERIFIED; INPUT_FILES_UNCHANGED',
+        union_computed=False,seeds=seeds,counts=totals,maxima=maxima,examples=examples,cases=cases,
+        original_aggregate=verified['aggregate'],
+        tolerance='Unchanged: abs(a-b) <= 1e-5 + 1e-6 * max(abs(a),abs(b)).',
+        limitations=[
+            'All unordered occurrence pairs with the same adapter ID are inspected, within and across arms.',
+            'Scores are not merged, modified or relabelled; no union availability or new method accuracy is computed.',
+            'Differences alone do not establish rounding error, model error or an observer bug.',
+            'Pair counts can repeat a sample and samples repeat images across seeds.',
+            'Examples are first failing pair and largest tolerance ratios, not selected by correctness.',
+            'Original controls, hashes, score reconstruction and strict union guards are unchanged.'])
 
 
 def analyze_pair(full, cg):
@@ -74,7 +198,10 @@ def analyze_pair(full, cg):
                 reference = entries[adapter]['reference']
                 for field in ('primary_logits','fused_logits'):
                     if not capture.vector_close(reference[field],candidate[field]):
-                        raise ValueError('Same adapter has different scores; cannot deduplicate')
+                        detail=dict(adapter=adapter,field=field,left=entries[adapter]['occurrences'][0],
+                            right=dict(arm=arm,slot=slot,selected=slot==selected),
+                            difference=vector_difference(reference[field],candidate[field]))
+                        raise ValueError('Same adapter has different scores; cannot deduplicate. DETAIL='+json.dumps(detail))
                     largest_difference = max(largest_difference,
                         max(abs(a-b) for a,b in zip(reference[field],candidate[field])))
                 if any(reference[k] != candidate[k] for k in ('primary_class','fused_class')):
@@ -280,6 +407,8 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--batch-dir',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--diagnose-duplicates',action='store_true',
+                        help='Inspect same-adapter score differences only; do not compute or relax the union.')
     args=parser.parse_args(argv)
     root,output=args.batch_dir.resolve(),args.output.resolve()
     if root==output or root in output.parents:
@@ -287,9 +416,22 @@ def main(argv=None):
     if output.exists() or not output.parent.is_dir():
         parser.error('Output must be a new file in an existing directory')
     try:
-        report=analyze_batch(root)
+        if args.diagnose_duplicates:
+            print('DUPLICATE_DIAGNOSTIC_ONLY: strict union checks remain unchanged.',flush=True)
+            report=diagnose_duplicates(root)
+        else:
+            report=analyze_batch(root)
         with output.open('x',encoding='utf-8') as stream:
             stream.write(json.dumps(report,indent=2,allow_nan=False)+'\n')
+        if args.diagnose_duplicates:
+            print('DUPLICATE_DIAGNOSTIC_COUNTS='+json.dumps(report['counts'],sort_keys=True))
+            print('DUPLICATE_DIAGNOSTIC_MAXIMA='+json.dumps(report['maxima'],sort_keys=True))
+            for case in report['examples']:
+                print('DUPLICATE_DIAGNOSTIC_EXAMPLE='+json.dumps(case,sort_keys=True))
+            print('UNION_NOT_COMPUTED=1; NO_TOLERANCE_CHANGE; NO_SCORES_MERGED')
+            print('CANDIDATE_DUPLICATE_DIAGNOSTIC_COMPLETE=4/4',flush=True)
+            print('REPORT='+str(output),flush=True)
+            return
         rates=report['aggregate']['equal_seed_task_balanced_pp']
         print('\nFOUR_SEED_TASK_BALANCED_PERCENT_OR_PP')
         for key in ('cg_actual_correct','full_actual_correct','final_output_oracle_correct',

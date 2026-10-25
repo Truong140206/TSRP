@@ -348,6 +348,43 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
         assert union_rates['union_available']>=max(union_rates['cg_available'],union_rates['full_available'])
         assert all(len(c['unique_candidates'])<=3 for c in union_report['cases'])
         assert all(p.read_bytes()==contents for p,contents in before.items())
+        # A valid capture can differ beyond the duplicate guard without failing
+        # its own fusion reconstruction. Diagnose it without merging or relaxing.
+        duplicate_batch=tmp_path/'duplicate_batch'
+        shutil.copytree(batch,duplicate_batch)
+        duplicate_folder=duplicate_batch/'ima'/'seed42'
+        duplicate_file=duplicate_folder/'full'/'candidate_task_00.json'
+        duplicate_saved=json.loads(duplicate_file.read_text())
+        candidate=next(r['candidates'][1-r['selected']] for r in duplicate_saved['samples']
+                       if len(r['candidates'])==2 and r['candidates'][0]['adapter']==r['candidates'][1]['adapter'])
+        candidate['fused_logits']=[v+5e-5 for v in candidate['fused_logits']]
+        duplicate_file.write_text(json.dumps(duplicate_saved))
+        duplicate_summary_path=duplicate_folder/'summary.json'
+        duplicate_summary=json.loads(duplicate_summary_path.read_text())
+        duplicate_summary['candidate_diagnostics']=spec.summarize_candidates(duplicate_folder,duplicate_summary)
+        duplicate_summary_path.write_text(json.dumps(duplicate_summary))
+        duplicate_before={p:p.read_bytes() for p in duplicate_batch.rglob('*') if p.is_file()}
+        duplicate_command=[sys.executable,'-B','-S',str(Path(candidate_union.__file__)),
+                           '--batch-dir',str(duplicate_batch),'--output',str(tmp_path/'duplicate_report.json'),
+                           '--diagnose-duplicates']
+        duplicate_cli=subprocess.run(duplicate_command,capture_output=True,text=True,timeout=60)
+        assert duplicate_cli.returncode==0, duplicate_cli.stdout+duplicate_cli.stderr
+        assert 'CANDIDATE_DUPLICATE_DIAGNOSTIC_COMPLETE=4/4' in duplicate_cli.stdout
+        assert 'CANDIDATE_UNION_COMPLETE' not in duplicate_cli.stdout
+        duplicate_report=json.loads((tmp_path/'duplicate_report.json').read_text())
+        assert duplicate_report['union_computed'] is False
+        assert duplicate_report['counts']['samples']==4*n
+        assert duplicate_report['counts']['fused_score_mismatch_pairs']>0
+        assert duplicate_report['counts']['prediction_mismatch_pairs']==0
+        assert duplicate_report['maxima']['primary_max_abs_difference']==0
+        assert duplicate_report['maxima']['fused_max_abs_difference']==pytest.approx(5e-5)
+        assert len(duplicate_report['input_sha256'])==164
+        assert 'aggregate' not in duplicate_report  # no new union/oracle result
+        strict_cli=subprocess.run(duplicate_command[:-3]+['--output',str(tmp_path/'strict_duplicate.json')],
+                                  capture_output=True,text=True,timeout=60)
+        assert strict_cli.returncode!=0 and 'cannot deduplicate' in strict_cli.stderr
+        assert not (tmp_path/'strict_duplicate.json').exists()
+        assert all(p.read_bytes()==contents for p,contents in duplicate_before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
         corrupt.write_text(original+' ')

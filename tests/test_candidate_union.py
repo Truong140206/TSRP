@@ -101,8 +101,73 @@ def test_different_scores_for_same_adapter_are_not_silently_merged():
     rp=[0.,0.,0.,0.,0.]
     full=record({0:[6.,0.,0.,0.,0.]},rp,0)
     cg=record({0:[7.,0.,0.,0.,0.]},rp,0)
-    with pytest.raises(ValueError,match='different scores'):
+    with pytest.raises(ValueError,match='different scores.*DETAIL='):
         union.analyze_pair(full,cg)
+
+
+def test_duplicate_diagnostics_measure_drift_without_relaxing_the_guard():
+    rp=[0.]*5
+    full=record({0:[6.,0.,0.,0.,0.]},rp,0)
+    cg=record({0:[7.,0.,0.,0.,0.]},rp,0)
+    original=copy.deepcopy((full,cg))
+    pairs=union.duplicate_comparisons(full,cg)
+    assert (full,cg)==original
+    assert len(pairs)==1
+    row=pairs[0]
+    assert row['score_mismatch'] and row['strict_reject']
+    assert not row['prediction_mismatch']
+    assert row['cross_arm']
+    assert row['primary']['max_abs_difference']==1.
+    assert row['primary']['max_tolerance_ratio']>1.
+    assert row['primary']['coordinates_exceeding_tolerance']==1
+    assert row['primary']['standardized_max_abs_difference']==pytest.approx(0.,abs=1e-12)
+    assert row['left']['arm']=='class_gate' and row['right']['arm']=='full'
+    assert row['left']['effective_rp_weight']<row['right']['effective_rp_weight']
+    with pytest.raises(ValueError,match='cannot deduplicate'):
+        union.analyze_pair(full,cg)
+
+
+def test_fused_only_drift_and_prediction_flip_have_distinct_diagnostics():
+    cg=record({0:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    full=copy.deepcopy(cg)
+    full['candidates'][0]['fused_logits']=[v+5e-5 for v in cg['candidates'][0]['fused_logits']]
+    row=union.duplicate_comparisons(full,cg)[0]
+    assert row['primary']['within_existing_tolerance']
+    assert not row['fused']['within_existing_tolerance']
+    assert not row['prediction_mismatch']
+    full=record({0:[0.,6.,0.,0.,0.]},[0.]*5,0)
+    row=union.duplicate_comparisons(full,cg)[0]
+    assert row['primary_class_changed'] and row['fused_class_changed']
+    assert row['prediction_mismatch']
+
+
+def test_diagnostic_covers_within_arm_and_cross_arm_pairs_not_only_first_duplicate():
+    item=record({0:[6.,0.,0.,0.,0.],1:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    item['candidates'][1]['adapter']=0
+    pairs=union.duplicate_comparisons(copy.deepcopy(item),item)
+    assert len(pairs)==6
+    assert sum(p['cross_arm'] for p in pairs)==4
+    assert not any(p['strict_reject'] for p in pairs)
+    other=record({2:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    single=record({0:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    assert union.duplicate_comparisons(other,single)==[]
+
+
+def test_near_tie_class_change_is_reported_even_when_scores_are_within_tolerance():
+    rp=[0.]*5
+    cg=record({0:[1.,1.-1e-7,0.,0.,0.]},rp,0)
+    full=record({0:[1.-1e-7,1.,0.,0.,0.]},rp,0)
+    row=union.duplicate_comparisons(full,cg)[0]
+    assert not row['score_mismatch']
+    assert row['prediction_mismatch'] and row['strict_reject']
+    with pytest.raises(ValueError,match='different predictions'):
+        union.analyze_pair(full,cg)
+
+
+@pytest.mark.parametrize('left,right', [([0.],[0.]),([0.,1.],[0.]),([0.,float('nan')],[0.,1.])])
+def test_invalid_vectors_do_not_become_tolerance_diagnostics(left,right):
+    with pytest.raises(ValueError,match='finite duplicate'):
+        union.vector_difference(left,right)
 
 
 def test_ties_follow_captured_classes_not_target_favouring_choices():
