@@ -329,6 +329,25 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
             assert accepted['aggregate']['equal_seed_task_balanced_accuracy'][arm]==pytest.approx(
                 result['arms'][arm]['task_balanced_accuracy']['final_class'])
         assert all(p.read_bytes()==contents for p,contents in before.items())
+        from tools import analyze_candidate_union as candidate_union
+        union_path=tmp_path/'candidate_union.json'
+        union_command=[sys.executable,'-B','-S',str(Path(candidate_union.__file__)),
+                       '--batch-dir',str(batch),'--output',str(union_path)]
+        union_cli=subprocess.run(union_command,capture_output=True,text=True,timeout=60)
+        assert union_cli.returncode==0, union_cli.stdout+union_cli.stderr
+        assert 'CANDIDATE_UNION_COMPLETE=4/4' in union_cli.stdout
+        union_report=json.loads(union_path.read_text())
+        assert union_report['status']=='LABEL_AWARE_DIAGNOSTIC_NOT_INFERENCE_RULE'
+        assert len(union_report['input_sha256'])==164
+        assert len(union_report['cases'])==union_report['aggregate']['counts']['samples']==4*n
+        union_rates=union_report['aggregate']['equal_seed_task_balanced_pp']
+        for arm,prefix in (('class_gate','cg'),('full','full')):
+            original=aggregate['aggregate'][arm]['equal_seed_task_balanced_pp']
+            assert union_rates[prefix+'_actual_correct']==pytest.approx(original['actual_correct'])
+            assert union_rates[prefix+'_available']==pytest.approx(original['available_correct'])
+        assert union_rates['union_available']>=max(union_rates['cg_available'],union_rates['full_available'])
+        assert all(len(c['unique_candidates'])<=3 for c in union_report['cases'])
+        assert all(p.read_bytes()==contents for p,contents in before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
         corrupt.write_text(original+' ')
@@ -346,6 +365,10 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
                                 capture_output=True,text=True,timeout=60)
         assert rejected.returncode!=0 and 'ROUTE_ACCEPTANCE_STOP' in rejected.stderr
         assert not (tmp_path/'rejected_acceptance.json').exists()
+        rejected=subprocess.run(union_command[:-1]+[str(tmp_path/'rejected_union.json')],
+                                capture_output=True,text=True,timeout=60)
+        assert rejected.returncode!=0 and 'CANDIDATE_UNION_STOP' in rejected.stderr
+        assert not (tmp_path/'rejected_union.json').exists()
         corrupt.write_text(original)
         score_path=destination/'full'/'candidate_task_00.json'
         good=score_path.read_text()

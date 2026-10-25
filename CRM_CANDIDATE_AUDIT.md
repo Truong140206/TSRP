@@ -213,3 +213,58 @@ An independent validation protocol is needed before selecting or claiming a
 new method, including checking that calibration images were not previously
 used to fit its adapters/RP head. The source hash and named rule are saved in
 the report for subsequent reproducible checks on other data.
+
+## Candidate overlap and routing additions
+
+`tools/analyze_candidate_union.py` answers a diagnostic question: does the
+Full path add a correct candidate that class-gate did not already evaluate,
+or does it mainly choose among options that were already available?
+
+For each paired image it forms A (class-gate candidates), B (Full candidates),
+and their union. Adapter IDs are deduplicated only after primary and fused
+vectors match within the existing capture tolerance and their captured class
+predictions match exactly. Disagreement stops the analysis; it is not silently
+treated as a new adapter or resolved with the label. The report records the
+largest duplicate score difference. The original shared CRM alternative and
+eligibility must match; a Full-only adapter must be its current routing
+proposal. No additional candidate is invented for an ineligible image.
+
+```bash
+python -B -S -u -m tools.analyze_candidate_union \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/candidate_union_new.json
+```
+
+Key event rates are percentages of all samples, averaged over tasks then seeds:
+
+| Field | Diagnostic meaning |
+|---|---|
+| `available_full_only` | A has no correct fused candidate; B adds one. This equals union availability minus A availability. |
+| `available_cg_only` | A has a correct fused candidate, but B has none. The union preserves this option. |
+| `cg_selector_missed` | The class-gate output is wrong although another candidate in A is correct. |
+| `full_selector_missed` | The Full output is wrong although another candidate in B is correct. |
+| `union_available` | At least one candidate in the union gives the correct fused class. |
+| `final_output_oracle_correct` | At least one of the two original selected outputs is correct. |
+
+All availability values are **label-aware oracle counts**, not measured
+accuracy of a new inference method. Captured tie decisions are preserved and
+ties are reported, never broken in favour of the target. These ceilings concern
+hard selection of fixed candidate classes, not arbitrary score mixing. Among
+images with no correct fused candidate, the report separately counts whether a
+primary candidate, RP, both, or neither still predict the correct class. Even
+when neither head's top class is correct, a different score mixture could
+produce a correct class; no impossibility claim about mixing follows.
+
+The report includes candidate sources, overlap, unique adapter counts and every
+paired case. Counts repeat images across seeds. Candidate quantities have their
+own per-image averages and are not labelled as accuracy. Both original actual
+accuracies and candidate availability counts must reproduce the existing audit.
+All 164 input hashes are checked before and after analysis; output must be a new
+file outside the batch. `CANDIDATE_UNION_COMPLETE=4/4` confirms completion.
+
+This CPU-only tool performs no fitting, threshold search, model forward, GPU
+work or training. It changes neither the normal evaluator nor the manuscript.
+It does not validate a new selector, evaluate retention or measure the live cost
+of retaining more candidates. A later method would require a valid selection
+protocol, comparison at the same inference budget and evaluation beyond the
+test diagnostics used to develop it.
