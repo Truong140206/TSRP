@@ -161,7 +161,7 @@ def diagnose_duplicates(root):
             'Original controls, hashes, score reconstruction and strict union guards are unchanged.'])
 
 
-def analyze_pair(full, cg):
+def analyze_pair(full, cg, *, class_coverage_only=False):
     """Compare verified captures; target is intentionally used for diagnosis."""
     if (any(full['sample'][k] != cg['sample'][k]
             for k in ('target', 'index', 'input_sha256'))
@@ -197,7 +197,7 @@ def analyze_pair(full, cg):
             if adapter in entries:
                 reference = entries[adapter]['reference']
                 for field in ('primary_logits','fused_logits'):
-                    if not capture.vector_close(reference[field],candidate[field]):
+                    if not class_coverage_only and not capture.vector_close(reference[field],candidate[field]):
                         detail=dict(adapter=adapter,field=field,left=entries[adapter]['occurrences'][0],
                             right=dict(arm=arm,slot=slot,selected=slot==selected),
                             difference=vector_difference(reference[field],candidate[field]))
@@ -263,12 +263,30 @@ def analyze_pair(full, cg):
         fused_class=e['reference']['fused_class'],occurrences=e['occurrences'],
         primary_tied_classes=e['primary_tied_classes'],fused_tied_classes=e['fused_tied_classes'])
         for i,e in sorted(entries.items())]
-    return dict(index=cg['sample']['index'],input_sha256=cg['sample']['input_sha256'],
+    result = dict(index=cg['sample']['index'],input_sha256=cg['sample']['input_sha256'],
         target=target,events=events,sizes=sizes,
         actual_classes=actual,cg_adapters=sorted(a),full_adapters=sorted(b),
         added_full_adapters=sorted(added),removed_cg_adapters=sorted(removed),
         correct_fused_adapters=sorted(correct_fused),correct_primary_adapters=sorted(correct_primary),
         unique_candidates=details,duplicate_score_max_abs_difference=largest_difference)
+    if class_coverage_only:
+        # Group only identical captured classes. No vector is averaged, selected
+        # for scoring, or declared interchangeable with another occurrence.
+        pairs=duplicate_comparisons(full,cg)
+        if any(p['prediction_mismatch'] for p in pairs):
+            raise ValueError('Same adapter has different predictions; cannot deduplicate')
+        result['duplicate_score_audit']=dict(
+            duplicate_pairs=len(pairs),
+            samples_with_score_mismatch=int(any(p['score_mismatch'] for p in pairs)),
+            score_mismatch_pairs=sum(p['score_mismatch'] for p in pairs),
+            primary_score_mismatch_pairs=sum(not p['primary']['within_existing_tolerance'] for p in pairs),
+            fused_score_mismatch_pairs=sum(not p['fused']['within_existing_tolerance'] for p in pairs),
+            prediction_mismatch_pairs=sum(p['prediction_mismatch'] for p in pairs),
+            maxima={kind+'_'+metric:max((p[kind][metric] for p in pairs),default=0.)
+                    for kind in ('primary','fused')
+                    for metric in ('max_abs_difference','max_tolerance_ratio')})
+        result['duplicate_score_differences']=[p for p in pairs if p['score_mismatch']]
+    return result
 
 
 def empty_counts():
@@ -330,7 +348,7 @@ def summarize_tasks(tasks):
     return dict(counts=counts,task_balanced_pp=rates,task_balanced_candidates_per_image=sizes,per_task=tasks)
 
 
-def analyze_batch(root):
+def analyze_batch(root, *, class_coverage_only=False):
     root=Path(root).resolve()
     before=input_snapshot(root)
     print('LABEL_AWARE_DIAGNOSTIC_ONLY: oracle availability is not deployed accuracy.',flush=True)
@@ -355,7 +373,8 @@ def analyze_batch(root):
             counts=empty_counts()
             for index in sorted(records['full']):
                 try:
-                    row=analyze_pair(records['full'][index],records['class_gate'][index])
+                    row=analyze_pair(records['full'][index],records['class_gate'][index],
+                                     class_coverage_only=class_coverage_only)
                 except (ValueError,KeyError,TypeError) as exc:
                     raise ValueError('seed=%d task=%d index=%d: %s'%(seed,task,index,exc)) from exc
                 add_case(counts,row)
@@ -382,7 +401,9 @@ def analyze_batch(root):
             s['task_balanced_candidates_per_image'][k] for s in seeds.values()) for k in SIZES})
     if input_snapshot(root) != before:
         raise ValueError('Input files changed during analysis')
-    return dict(schema=1,status='LABEL_AWARE_DIAGNOSTIC_NOT_INFERENCE_RULE',batch_dir=str(root),
+    report=dict(schema=1,status='LABEL_AWARE_DIAGNOSTIC_NOT_INFERENCE_RULE',batch_dir=str(root),
+        deduplication_policy='identical_captured_classes_only' if class_coverage_only else 'strict_scores_and_classes',
+        score_interchangeability_claimed=False,
         source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),input_sha256=before,
         verification='ORIGINAL_CONTROLS_AND_CANDIDATE_COUNTS_MATCH; INPUT_FILES_UNCHANGED',
         seeds=seeds,aggregate=aggregate,cases=cases,
@@ -394,21 +415,36 @@ def analyze_batch(root):
         limitations=[
             'No inference rule or new measured method accuracy; labels are used for diagnostic counting.',
             'Only candidates already evaluated are included; no candidate is invented for an ineligible sample.',
-            'Identical adapter IDs require matching primary/fused scores within existing capture tolerance and identical captured classes.',
+            ('Identical adapter IDs require identical captured primary/fused classes; score differences remain recorded, not merged or used for selection.'
+             if class_coverage_only else
+             'Identical adapter IDs require matching primary/fused scores within existing capture tolerance and identical captured classes.'),
             'Ties follow recorded class choices, never a target-favouring choice; tie presence is reported.',
             'Oracle ceilings apply to hard selection of fixed captured classes, not arbitrary score mixtures or new experts.',
             'When all primary and RP top classes are wrong, a new mixture could still predict a different, correct class.',
             'Counts repeat images across seeds; reported rates average tasks then seeds.',
             'Test diagnostics do not supply independent validation for selecting a new method.',
             'No GPU, model forwards, training, normal evaluator or manuscript changes; live costs and retention remain unmeasured.'])
+    if class_coverage_only:
+        checks=[row['duplicate_score_audit'] for row in cases]
+        report['duplicate_score_audit']={key:sum(c[key] for c in checks)
+                                        for key in checks[0] if key!='maxima'}
+        report['duplicate_score_audit']['maxima']={key:max(c['maxima'][key] for c in checks)
+                                                  for key in checks[0]['maxima']}
+        report['limitations'].append(
+            'Class coverage is exact for the saved class choices, even if their score vectors differ; '
+            'this does not establish score equivalence, the cause of drift, or a safe future score selector.')
+    return report
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--batch-dir',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--diagnose-duplicates',action='store_true',
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--diagnose-duplicates',action='store_true',
                         help='Inspect same-adapter score differences only; do not compute or relax the union.')
+    mode.add_argument('--class-coverage-only',action='store_true',
+                      help='Count identical captured classes per adapter, retaining all score mismatch diagnostics; never merge scores.')
     args=parser.parse_args(argv)
     root,output=args.batch_dir.resolve(),args.output.resolve()
     if root==output or root in output.parents:
@@ -420,7 +456,7 @@ def main(argv=None):
             print('DUPLICATE_DIAGNOSTIC_ONLY: strict union checks remain unchanged.',flush=True)
             report=diagnose_duplicates(root)
         else:
-            report=analyze_batch(root)
+            report=analyze_batch(root,class_coverage_only=args.class_coverage_only)
         with output.open('x',encoding='utf-8') as stream:
             stream.write(json.dumps(report,indent=2,allow_nan=False)+'\n')
         if args.diagnose_duplicates:
@@ -439,6 +475,9 @@ def main(argv=None):
                     'available_full_only','available_cg_only','cg_selector_missed','full_selector_missed'):
             print('%-30s %.6f'%(key,rates[key]))
         print('CANDIDATE_UNION_FOUR_SEED_MEANS='+json.dumps(report['aggregate'],sort_keys=True))
+        if args.class_coverage_only:
+            print('CANDIDATE_UNION_DUPLICATE_SCORE_AUDIT='+json.dumps(report['duplicate_score_audit'],sort_keys=True))
+            print('CLASS_COVERAGE_ONLY=1; NO_TOLERANCE_CHANGE; NO_SCORES_MERGED')
         print('ORACLE_ONLY: candidate availability is not deployed accuracy or an inference rule.')
         print('CANDIDATE_UNION_COMPLETE=4/4',flush=True)
         print('REPORT='+str(output),flush=True)

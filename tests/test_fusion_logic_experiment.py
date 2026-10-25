@@ -384,6 +384,24 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
                                   capture_output=True,text=True,timeout=60)
         assert strict_cli.returncode!=0 and 'cannot deduplicate' in strict_cli.stderr
         assert not (tmp_path/'strict_duplicate.json').exists()
+        class_path=tmp_path/'class_coverage.json'
+        class_cli=subprocess.run(duplicate_command[:-3]+['--output',str(class_path),'--class-coverage-only'],
+                                 capture_output=True,text=True,timeout=60)
+        assert class_cli.returncode==0, class_cli.stdout+class_cli.stderr
+        assert 'CANDIDATE_UNION_COMPLETE=4/4' in class_cli.stdout
+        assert 'CLASS_COVERAGE_ONLY=1; NO_TOLERANCE_CHANGE; NO_SCORES_MERGED' in class_cli.stdout
+        class_report=json.loads(class_path.read_text())
+        assert class_report['deduplication_policy']=='identical_captured_classes_only'
+        assert class_report['score_interchangeability_claimed'] is False
+        assert class_report['aggregate']['equal_seed_task_balanced_pp']==union_rates
+        assert class_report['input_sha256']==duplicate_report['input_sha256']
+        for key,value in class_report['duplicate_score_audit'].items():
+            if key=='maxima':
+                assert value==duplicate_report['maxima']
+            else:
+                diagnostic_key='samples_with_strict_reject' if key=='samples_with_score_mismatch' else key
+                assert value==duplicate_report['counts'][diagnostic_key]
+        assert sum(len(c['duplicate_score_differences']) for c in class_report['cases'])==duplicate_report['counts']['score_mismatch_pairs']
         assert all(p.read_bytes()==contents for p,contents in duplicate_before.items())
         corrupt=batch/'ima'/'seed45'/'full'/'candidate_task_00.json'
         original=corrupt.read_text()
@@ -406,6 +424,10 @@ def test_full_sequence_replay_and_all_final_arms(monkeypatch,tmp_path,experiment
                                 capture_output=True,text=True,timeout=60)
         assert rejected.returncode!=0 and 'CANDIDATE_UNION_STOP' in rejected.stderr
         assert not (tmp_path/'rejected_union.json').exists()
+        rejected=subprocess.run(union_command[:-1]+[str(tmp_path/'rejected_class_coverage.json'),'--class-coverage-only'],
+                                capture_output=True,text=True,timeout=60)
+        assert rejected.returncode!=0 and 'CANDIDATE_UNION_STOP' in rejected.stderr
+        assert not (tmp_path/'rejected_class_coverage.json').exists()
         corrupt.write_text(original)
         score_path=destination/'full'/'candidate_task_00.json'
         good=score_path.read_text()

@@ -221,7 +221,7 @@ Full path add a correct candidate that class-gate did not already evaluate,
 or does it mainly choose among options that were already available?
 
 For each paired image it forms A (class-gate candidates), B (Full candidates),
-and their union. Adapter IDs are deduplicated only after primary and fused
+and their union. By default, adapter IDs are deduplicated only after primary and fused
 vectors match within the existing capture tolerance and their captured class
 predictions match exactly. Disagreement stops the analysis; it is not silently
 treated as a new adapter or resolved with the label. The report records the
@@ -300,3 +300,39 @@ whether the cause is floating-point execution, model behaviour or observation.
 not successful completion of the union. The ordinary union command retains its
 strict guards. All input hashes must remain unchanged and the new report must
 stay outside the input batch. No GPU evaluation or training is performed.
+
+### Count class coverage when duplicate scores differ
+
+After examining the duplicate diagnostic, use `--class-coverage-only` for the
+narrower question of whether the saved candidate **classes** contain the target:
+
+```bash
+python -B -S -u -m tools.analyze_candidate_union \
+  --batch-dir /path/to/hrm-pet-output/crm_candidates_new \
+  --output /path/to/hrm-pet-output/candidate_class_coverage_new.json \
+  --class-coverage-only
+```
+
+For each image, all occurrences of an adapter must still have exactly the same
+captured primary class and fused class. A class disagreement stops the analysis,
+including a near-tie or exact tie with different recorded winners. No label is
+used to resolve a disagreement. Equal captured classes suffice for this coverage
+count: grouping repeated copies cannot add or remove a correct candidate.
+
+This mode does **not** require equal duplicate score vectors, merge or average
+them, or declare them interchangeable. It checks every same-adapter occurrence
+pair against the unchanged score tolerance, retains all violating pairs and
+their differences, and reports counts and maxima. The original vectors remain
+in the input files identified by their verified hashes. Both original arms'
+actual accuracies, candidate coverage and missed-choice counts must still match.
+
+The report identifies `deduplication_policy=identical_captured_classes_only` and
+`score_interchangeability_claimed=false`. Completion includes
+`CLASS_COVERAGE_ONLY=1; NO_TOLERANCE_CHANGE; NO_SCORES_MERGED` followed by
+`CANDIDATE_UNION_COMPLETE=4/4`. The default strict mode and the separate
+`--diagnose-duplicates` mode remain available. The two optional modes are
+mutually exclusive.
+
+Class coverage does not identify the cause of score differences or establish
+that they are harmless to a future score-based selector. It remains a label-aware
+oracle count of recorded predictions, not deployed accuracy or a new algorithm.

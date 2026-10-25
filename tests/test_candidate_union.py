@@ -105,6 +105,53 @@ def test_different_scores_for_same_adapter_are_not_silently_merged():
         union.analyze_pair(full,cg)
 
 
+def test_class_coverage_groups_equal_classes_without_claiming_score_equivalence():
+    rp=[0.]*5
+    full=record({0:[6.,0.,0.,0.,0.]},rp,0)
+    cg=record({0:[7.,0.,0.,0.,0.]},rp,0)
+    original=copy.deepcopy((full,cg))
+    row=union.analyze_pair(full,cg,class_coverage_only=True)
+    assert (full,cg)==original
+    assert row['sizes']['union_unique']==1
+    assert row['events']['available_both']
+    assert not row['events']['available_full_only']
+    assert row['duplicate_score_audit']['score_mismatch_pairs']==1
+    assert row['duplicate_score_audit']['prediction_mismatch_pairs']==0
+    assert row['duplicate_score_audit']['maxima']['primary_max_abs_difference']==1.
+    assert len(row['duplicate_score_differences'])==1
+    assert row['duplicate_score_differences'][0]['strict_reject']
+    # Agreement of classes is sufficient for this count even for a large score
+    # difference; it says nothing about numerical equivalence or future scoring.
+    for item in (full,cg):
+        item['sample']['target']=1
+    wrong=union.analyze_pair(full,cg,class_coverage_only=True)
+    assert wrong['unique_candidates']==row['unique_candidates']
+    assert wrong['events']['available_neither']
+
+
+def test_class_coverage_audits_all_pairs_without_overcounting_candidates():
+    item=record({0:[6.,0.,0.,0.,0.],1:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    item['candidates'][1]['adapter']=0
+    full=copy.deepcopy(item)
+    full['candidates'][1]['primary_logits'][0]+=5e-5
+    original=copy.deepcopy((full,item))
+    row=union.analyze_pair(full,item,class_coverage_only=True)
+    assert (full,item)==original
+    assert row['sizes']['union_unique']==1
+    assert row['duplicate_score_audit']['duplicate_pairs']==6
+    assert row['duplicate_score_audit']['primary_score_mismatch_pairs']==3
+    assert row['duplicate_score_audit']['samples_with_score_mismatch']==1
+    assert len(row['duplicate_score_differences'])==3
+
+
+@pytest.mark.parametrize('class_coverage_only',[False,True])
+def test_different_captured_classes_stop_both_coverage_modes(class_coverage_only):
+    full=record({0:[0.,6.,0.,0.,0.]},[0.]*5,0)
+    cg=record({0:[6.,0.,0.,0.,0.]},[0.]*5,0)
+    with pytest.raises(ValueError,match='cannot deduplicate'):
+        union.analyze_pair(full,cg,class_coverage_only=class_coverage_only)
+
+
 def test_duplicate_diagnostics_measure_drift_without_relaxing_the_guard():
     rp=[0.]*5
     full=record({0:[6.,0.,0.,0.,0.]},rp,0)
@@ -153,7 +200,8 @@ def test_diagnostic_covers_within_arm_and_cross_arm_pairs_not_only_first_duplica
     assert union.duplicate_comparisons(other,single)==[]
 
 
-def test_near_tie_class_change_is_reported_even_when_scores_are_within_tolerance():
+@pytest.mark.parametrize('class_coverage_only',[False,True])
+def test_near_tie_class_change_is_reported_even_when_scores_are_within_tolerance(class_coverage_only):
     rp=[0.]*5
     cg=record({0:[1.,1.-1e-7,0.,0.,0.]},rp,0)
     full=record({0:[1.-1e-7,1.,0.,0.,0.]},rp,0)
@@ -161,7 +209,7 @@ def test_near_tie_class_change_is_reported_even_when_scores_are_within_tolerance
     assert not row['score_mismatch']
     assert row['prediction_mismatch'] and row['strict_reject']
     with pytest.raises(ValueError,match='different predictions'):
-        union.analyze_pair(full,cg)
+        union.analyze_pair(full,cg,class_coverage_only=class_coverage_only)
 
 
 @pytest.mark.parametrize('left,right', [([0.],[0.]),([0.,1.],[0.]),([0.,float('nan')],[0.,1.])])
@@ -170,16 +218,17 @@ def test_invalid_vectors_do_not_become_tolerance_diagnostics(left,right):
         union.vector_difference(left,right)
 
 
-def test_ties_follow_captured_classes_not_target_favouring_choices():
+@pytest.mark.parametrize('class_coverage_only',[False,True])
+def test_ties_follow_captured_classes_not_target_favouring_choices(class_coverage_only):
     item=record({0:[0.]*5},[0.]*5,1)
-    row=union.analyze_pair(copy.deepcopy(item),item)
+    row=union.analyze_pair(copy.deepcopy(item),item,class_coverage_only=class_coverage_only)
     assert row['events']['fused_ties_present']
     assert not row['events']['union_available']
     other=copy.deepcopy(item)
     other['candidates'][0]['fused_class']=1
     other['sample']['final_class']=1
     with pytest.raises(ValueError,match='different predictions'):
-        union.analyze_pair(other,item)
+        union.analyze_pair(other,item,class_coverage_only=class_coverage_only)
 
 
 @pytest.mark.parametrize('field', ['target','index','input_sha256'])
@@ -222,6 +271,10 @@ def test_cli_is_stdlib_only_and_preserves_inputs_and_existing_output(tmp_path):
     result=subprocess.run(command+['--help'],cwd=tmp_path,capture_output=True,text=True,timeout=30)
     assert result.returncode==0 and 'Label-aware' in result.stdout
     batch,output=tmp_path/'missing',tmp_path/'out.json'
+    incompatible=subprocess.run(command+['--batch-dir',str(batch),'--output',str(output),
+        '--class-coverage-only','--diagnose-duplicates'],capture_output=True,text=True,timeout=30)
+    assert incompatible.returncode==2 and 'not allowed' in incompatible.stderr
+    assert not output.exists()
     result=subprocess.run(command+['--batch-dir',str(batch),'--output',str(output)],
         capture_output=True,text=True,timeout=30)
     assert result.returncode!=0 and 'CANDIDATE_UNION_STOP' in result.stderr
